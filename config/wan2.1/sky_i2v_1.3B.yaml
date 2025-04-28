@@ -1,0 +1,86 @@
+format: civitai
+pipeline: Wan
+transformer_additional_kwargs:
+  transformer_subpath: ./
+  dict_mapping:
+    in_dim: in_channels
+    dim: hidden_size
+
+vae_kwargs:
+  vae_subpath: Wan2.1_VAE.pth
+  temporal_compression_ratio: 4
+  spatial_compression_ratio: 8
+
+text_encoder_kwargs:
+  text_encoder_subpath: models_t5_umt5-xxl-enc-bf16.pth
+  tokenizer_subpath: google/umt5-xxl
+  text_length: 512
+  vocab: 256384
+  dim: 4096
+  dim_attn: 4096
+  dim_ffn: 10240
+  num_heads: 64
+  num_layers: 24
+  num_buckets: 32
+  shared_pos: False
+  dropout: 0.0
+
+scheduler_kwargs:
+  scheduler_subpath: null
+  num_train_timesteps: 1000
+  shift: 5.0
+  use_dynamic_shifting: false
+  base_shift: 0.5
+  max_shift: 1.15
+  base_image_seq_len: 256
+  max_image_seq_len: 4096
+
+image_encoder_kwargs:
+  image_encoder_subpath: models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
+
+data:
+  n_sample_frames: 77 # pick [n_sample_frames] frames from 90 frames
+  past_n: 4 # pick [past_n] frames from 10 frames
+  train_width: 544 
+  train_height: 960 
+  
+  union_bbox_scale: [1.2, 1.4]
+  mouth_bbox_scale: 1.5 # mouth bounding box scale for mediapipe's detection
+  eye_bbox_scale: 2.0 # eye bounding box scale for mediapipe's detection
+  hybrid_face_mask: true
+  
+  flip_aug: true
+
+  # pose_max: [45, 40, 30]
+  # pose_delta: [40, 25, 20]
+  # lip_open_ratio: 0.0
+  hyperIQA_min: 30
+  get_data_type: video
+
+  past_frame_is_ref: False
+  get_double_sample: False
+
+  train_fps: 25
+  vx_ratio_crop: -0.20
+  vy_ratio_crop: 0
+  driving_video_scale: 1.2
+  body_score_thresh: 3
+  body_level: 3
+
+  cache_file_path: 
+    - [/home/weili/RealTimeV3Cache/20250428/394w_0w_20w_strongStaticBack_WeakSyncNet_body3_13k_IQA30_x3, 1, video]
+
+  test_cases:
+    - [
+      /mnt/weka/hw_workspace/sr_workspace/VideoX-Fun0428/asset/test_case_0428/real_half_body_man1.png,
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward"
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/VideoX-Fun0428/asset/test_case_0428/real_half_body_man2.png,
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward"
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/VideoX-Fun0428/asset/test_case_0428/real_half_body_man3.png,
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward"
+    ]

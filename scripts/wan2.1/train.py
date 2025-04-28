@@ -67,10 +67,12 @@ from videox_fun.data.bucket_sampler import (ASPECT_RATIO_512,
                                            ASPECT_RATIO_RANDOM_CROP_512,
                                            ASPECT_RATIO_RANDOM_CROP_PROB,
                                            AspectRatioBatchImageVideoSampler,
+                                           XCImageVideoSampler,
                                            RandomSampler, get_closest_ratio)
 from videox_fun.data.dataset_image_video import (ImageVideoDataset,
                                                 ImageVideoSampler,
                                                 get_random_mask)
+from videox_fun.data.emo_video_live_body_load import LiveVideoLoadDataset
 from videox_fun.models import (AutoencoderKLWan, CLIPModel, WanT5EncoderModel,
                               WanTransformer3DModel)
 from videox_fun.pipeline import WanPipeline, WanI2VPipeline
@@ -204,35 +206,37 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                 if args.train_mode != "normal":
                     with torch.autocast("cuda", dtype=weight_dtype):
                         video_length = int((args.video_sample_n_frames - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1 if args.video_sample_n_frames != 1 else 1
-                        input_video, input_video_mask, _ = get_image_to_video_latent(None, None, video_length=video_length, sample_size=[args.video_sample_size, args.video_sample_size])
+                        input_video, input_video_mask, clip_image = get_image_to_video_latent(args.validation_image_starts[i], None, video_length=video_length, sample_size=[args.valid_video_height, args.valid_video_width])
                         sample = pipeline(
                             args.validation_prompts[i],
                             num_frames = video_length,
-                            negative_prompt = "bad detailed",
-                            height      = args.video_sample_size,
-                            width       = args.video_sample_size,
+                            negative_prompt = args.validation_neg_prompts[i],
+                            height      = args.valid_video_height,
+                            width       = args.valid_video_width,
                             guidance_scale = 6.0,
                             generator   = generator,
 
                             video        = input_video,
                             mask_video   = input_video_mask,
+                            clip_image   = clip_image,
                         ).videos
                         os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
                         save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-{i}.gif"))
 
                         video_length = 1
-                        input_video, input_video_mask, _ = get_image_to_video_latent(None, None, video_length=video_length, sample_size=[args.video_sample_size, args.video_sample_size])
+                        input_video, input_video_mask, _ = get_image_to_video_latent(args.validation_image_starts[i], None, video_length=video_length, sample_size=[args.valid_video_height, args.valid_video_width])
                         sample = pipeline(
                             args.validation_prompts[i],
                             num_frames = video_length,
-                            negative_prompt = "bad detailed",
-                            height      = args.video_sample_size,
-                            width       = args.video_sample_size,
+                            negative_prompt = args.validation_neg_prompts[i],
+                            height      = args.valid_video_height,
+                            width       = args.valid_video_width,
                             guidance_scale = 6.0,
                             generator   = generator, 
 
                             video        = input_video,
                             mask_video   = input_video_mask,
+                            clip_image   = clip_image,
                         ).videos
                         os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
                         save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-image-{i}.gif"))
@@ -241,9 +245,9 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                         sample = pipeline(
                             args.validation_prompts[i],
                             num_frames = args.video_sample_n_frames,
-                            negative_prompt = "bad detailed",
-                            height      = args.video_sample_size,
-                            width       = args.video_sample_size,
+                            negative_prompt = args.validation_neg_prompts[i],
+                            height      = args.valid_video_height,
+                            width       = args.valid_video_width,
                             generator   = generator
                         ).videos
                         os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
@@ -252,9 +256,9 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                         sample = pipeline(
                             args.validation_prompts[i], 
                             num_frames = args.video_sample_n_frames,
-                            negative_prompt = "bad detailed",
-                            height      = args.video_sample_size,
-                            width       = args.video_sample_size,
+                            negative_prompt = args.validation_neg_prompts[i],
+                            height      = args.valid_video_height,
+                            width       = args.valid_video_width,
                             generator   = generator
                         ).videos
                         os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
@@ -272,6 +276,7 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
         print(f"Eval error with info {e}")
+        import traceback;traceback.print_exc()
         return None
 
 def linear_decay(initial_value, final_value, total_steps, current_step):
@@ -343,6 +348,20 @@ def parse_args():
         default=None,
         nargs="+",
         help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
+    )
+    parser.add_argument(
+        "--validation_neg_prompts",
+        type=str,
+        default=None,
+        nargs="+",
+        help=("A set of prompts evaluated every `--validation_epochs` and logged to `--report_to`."),
+    )
+    parser.add_argument(
+        "--validation_image_starts",
+        type=str,
+        default=None,
+        nargs="+",
+        help=("A set of images path evaluated every `--validation_epochs` and logged to `--report_to`."),
     )
     parser.add_argument(
         "--output_dir",
@@ -580,6 +599,9 @@ def parse_args():
         "--motion_sub_loss_ratio", type=float, default=0.25, help="The ratio of motion sub loss."
     )
     parser.add_argument(
+        "--preprocess_text_embed", type=str, default=""
+    )
+    parser.add_argument(
         "--train_sampling_steps",
         type=int,
         default=1000,
@@ -604,6 +626,18 @@ def parse_args():
     )
     parser.add_argument(
         "--image_sample_size",
+        type=int,
+        default=512,
+        help="Sample size of the video.",
+    )
+    parser.add_argument(
+        "--valid_video_height",
+        type=int,
+        default=512,
+        help="Sample size of the video.",
+    )
+    parser.add_argument(
+        "--valid_video_width",
         type=int,
         default=512,
         help="Sample size of the video.",
@@ -748,6 +782,15 @@ def main():
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
     config = OmegaConf.load(args.config_path)
+    args.validation_prompts = []
+    args.validation_neg_prompts = []
+    args.validation_image_starts = []
+    for validation_image_start, validation_prompt, validation_neg_prompt in config.data.test_cases:
+        args.validation_prompts.append(validation_prompt)
+        args.validation_neg_prompts.append(validation_neg_prompt)
+        args.validation_image_starts.append(validation_image_start)
+    
+    
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     accelerator = Accelerator(
@@ -1074,19 +1117,32 @@ def main():
 
     # Get the training dataset
     sample_n_frames_bucket_interval = vae.config.temporal_compression_ratio
-    
-    train_dataset = ImageVideoDataset(
-        args.train_data_meta, args.train_data_dir,
-        video_sample_size=args.video_sample_size, video_sample_stride=args.video_sample_stride, video_sample_n_frames=args.video_sample_n_frames, 
-        video_repeat=args.video_repeat, 
-        image_sample_size=args.image_sample_size,
-        enable_bucket=args.enable_bucket, enable_inpaint=True if args.train_mode != "normal" else False,
+    config.data.n_sample_frames = args.video_sample_n_frames - config.data.past_n
+    # train_dataset = ImageVideoDataset(
+    #     args.train_data_meta, args.train_data_dir,
+    #     video_sample_size=args.video_sample_size, video_sample_stride=args.video_sample_stride, video_sample_n_frames=args.video_sample_n_frames, 
+    #     video_repeat=args.video_repeat, 
+    #     image_sample_size=args.image_sample_size,
+    #     enable_bucket=args.enable_bucket, enable_inpaint=True if args.train_mode != "normal" else False,
+    # )
+    train_dataset = LiveVideoLoadDataset(
+        width=config.data.train_width,
+        height=config.data.train_height,
+        cfg=config,
+        split='train',
+        enable_bucket=args.enable_bucket,
+        resume_step=0,
     )
     
     if args.enable_bucket:
         aspect_ratio_sample_size = {key : [x / 512 * args.video_sample_size for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
         batch_sampler_generator = torch.Generator().manual_seed(args.seed)
-        batch_sampler = AspectRatioBatchImageVideoSampler(
+        # batch_sampler = AspectRatioBatchImageVideoSampler(
+        #     sampler=RandomSampler(train_dataset, generator=batch_sampler_generator), dataset=train_dataset.dataset, 
+        #     batch_size=args.train_batch_size, train_folder = args.train_data_dir, drop_last=True,
+        #     aspect_ratios=aspect_ratio_sample_size,
+        # )
+        batch_sampler = XCImageVideoSampler(
             sampler=RandomSampler(train_dataset, generator=batch_sampler_generator), dataset=train_dataset.dataset, 
             batch_size=args.train_batch_size, train_folder = args.train_data_dir, drop_last=True,
             aspect_ratios=aspect_ratio_sample_size,
@@ -1303,6 +1359,12 @@ def main():
     vae.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
     if not args.enable_text_encoder_in_dataloader:
         text_encoder.to(accelerator.device if not args.low_vram else "cpu")
+    if args.preprocess_text_embed != "" and os.path.exists(args.preprocess_text_embed):
+        args.preprocess_text_embed = torch.load(args.preprocess_text_embed).to(accelerator.device)
+        text_encoder.to("cpu")
+    else:
+        args.preprocess_text_embed = None
+        
     if args.train_mode != "normal":
         clip_image_encoder.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
 
@@ -1318,6 +1380,9 @@ def main():
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
         tracker_config.pop("validation_prompts")
+        tracker_config.pop("validation_neg_prompts")
+        tracker_config.pop("validation_image_starts")
+        tracker_config.pop("preprocess_text_embed")
         tracker_config.pop("trainable_modules")
         tracker_config.pop("trainable_modules_low_learning_rate")
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
@@ -1586,7 +1651,7 @@ def main():
 
                 if args.enable_text_encoder_in_dataloader:
                     prompt_embeds = batch['encoder_hidden_states'].to(device=latents.device)
-                else:
+                elif args.preprocess_text_embed is None:
                     with torch.no_grad():
                         prompt_ids = tokenizer(
                             batch['text'], 
@@ -1598,11 +1663,13 @@ def main():
                         )
                         text_input_ids = prompt_ids.input_ids
                         prompt_attention_mask = prompt_ids.attention_mask
-
+                        import pdb; pdb.set_trace()
                         seq_lens = prompt_attention_mask.gt(0).sum(dim=1).long()
                         prompt_embeds = text_encoder(text_input_ids.to(latents.device), attention_mask=prompt_attention_mask.to(latents.device))[0]
                         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
-
+                else:
+                    prompt_embeds = [args.preprocess_text_embed for _ in range(len(batch['text']))]
+                
                 if args.low_vram and not args.enable_text_encoder_in_dataloader:
                     text_encoder.to('cpu')
                     torch.cuda.empty_cache()

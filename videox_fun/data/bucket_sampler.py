@@ -6,7 +6,9 @@ from typing import (Generic, Iterable, Iterator, List, Optional, Sequence,
 import cv2
 import numpy as np
 import torch
+import pickle
 from PIL import Image
+from decord import VideoReader
 from torch.utils.data import BatchSampler, Dataset, Sampler
 
 ASPECT_RATIO_512 = {
@@ -367,6 +369,80 @@ class AspectRatioBatchImageVideoSampler(BatchSampler):
                 except Exception as e:
                     print(e, self.dataset[idx], "This item is error, please check it.")
                     continue
+                # find the closest aspect ratio
+                closest_ratio = min(self.aspect_ratios.keys(), key=lambda r: abs(float(r) - ratio))
+                if closest_ratio not in self.current_available_bucket_keys:
+                    continue
+                bucket = self.bucket['video'][closest_ratio]
+                bucket.append(idx)
+                # yield a batch of indices in the same aspect ratio group
+                if len(bucket) == self.batch_size:
+                    yield bucket[:]
+                    del bucket[:]
+                    
+class XCImageVideoSampler(AspectRatioBatchImageVideoSampler):
+    def __iter__(self):
+        for idx in self.sampler:
+            folder, content_type = self.dataset[idx]
+            try:
+                with open(os.path.join(folder, "meta_result.pkl"), 'rb') as f:
+                    meta_result = pickle.load(f) 
+                width, height = meta_result["width"], meta_result["height"]
+                ratio = height / width
+            except Exception as e:
+                print(e, self.dataset[idx], "This item is error, please check it.")
+                continue
+            
+            if content_type == 'image':
+                # find the closest aspect ratio
+                closest_ratio = min(self.aspect_ratios.keys(), key=lambda r: abs(float(r) - ratio))
+                if closest_ratio not in self.current_available_bucket_keys:
+                    continue
+                bucket = self.bucket['image'][closest_ratio]
+                bucket.append(idx)
+                # yield a batch of indices in the same aspect ratio group
+                if len(bucket) == self.batch_size:
+                    yield bucket[:]
+                    del bucket[:]
+            else:
+                # find the closest aspect ratio
+                closest_ratio = min(self.aspect_ratios.keys(), key=lambda r: abs(float(r) - ratio))
+                if closest_ratio not in self.current_available_bucket_keys:
+                    continue
+                bucket = self.bucket['video'][closest_ratio]
+                bucket.append(idx)
+                # yield a batch of indices in the same aspect ratio group
+                if len(bucket) == self.batch_size:
+                    yield bucket[:]
+                    del bucket[:]
+                    
+class SEGOBJECTImageVideoSampler(AspectRatioBatchImageVideoSampler):
+    def __iter__(self):
+        for idx in self.sampler:
+            (folder, name), content_type = self.dataset[idx]
+            try:
+                vid_path = f'{folder}/videos_resampled/{name}+resampled.mp4'
+                if not os.path.exists(vid_path):
+                    vid_path = f'{folder}/videos/{name}.mp4'
+                video_reader = VideoReader(vid_path)
+                hd, wd, _ = video_reader[0].asnumpy().shape
+                ratio = hd / wd
+            except Exception as e:
+                print(e, self.dataset[idx], "This item is error, please check it.")
+                continue
+            
+            if content_type == 'image':
+                # find the closest aspect ratio
+                closest_ratio = min(self.aspect_ratios.keys(), key=lambda r: abs(float(r) - ratio))
+                if closest_ratio not in self.current_available_bucket_keys:
+                    continue
+                bucket = self.bucket['image'][closest_ratio]
+                bucket.append(idx)
+                # yield a batch of indices in the same aspect ratio group
+                if len(bucket) == self.batch_size:
+                    yield bucket[:]
+                    del bucket[:]
+            else:
                 # find the closest aspect ratio
                 closest_ratio = min(self.aspect_ratios.keys(), key=lambda r: abs(float(r) - ratio))
                 if closest_ratio not in self.current_available_bucket_keys:
