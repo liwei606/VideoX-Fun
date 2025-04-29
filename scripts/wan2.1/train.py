@@ -206,6 +206,7 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                 if args.train_mode != "normal":
                     with torch.autocast("cuda", dtype=weight_dtype):
                         video_length = int((args.video_sample_n_frames - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1 if args.video_sample_n_frames != 1 else 1
+                        basename = os.path.basename(args.validation_image_starts[i])[:-4]
                         input_video, input_video_mask, clip_image = get_image_to_video_latent(args.validation_image_starts[i], None, video_length=video_length, sample_size=[args.valid_video_height, args.valid_video_width])
                         sample = pipeline(
                             args.validation_prompts[i],
@@ -221,7 +222,7 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                             clip_image   = clip_image,
                         ).videos
                         os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
-                        save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-{i}.gif"))
+                        save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-{i}-{basename}.mp4"))
 
                         video_length = 1
                         input_video, input_video_mask, _ = get_image_to_video_latent(args.validation_image_starts[i], None, video_length=video_length, sample_size=[args.valid_video_height, args.valid_video_width])
@@ -239,7 +240,9 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                             clip_image   = clip_image,
                         ).videos
                         os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
-                        save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-image-{i}.gif"))
+                        save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-image-{i}-{basename}.mp4"))
+                        sample_dir = os.path.join(args.output_dir, "sample")
+                        os.system(f"ln -s {args.validation_image_starts[i]} {sample_dir}")
                 else:
                     with torch.autocast("cuda", dtype=weight_dtype):
                         sample = pipeline(
@@ -1175,6 +1178,7 @@ def main():
             new_examples["text"]         = []
             # Used in Inpaint mode 
             if args.train_mode != "normal":
+                new_examples["union_mouth_masks"] = []
                 new_examples["mask_pixel_values"] = []
                 new_examples["mask"] = []
                 new_examples["clip_pixel_values"] = []
@@ -1229,11 +1233,12 @@ def main():
                 random_sample_size = [int(x / 16) * 16 for x in random_sample_size]
 
             for example in examples:
+                # To 0~1
+                pixel_values = torch.from_numpy(example["pixel_values"]).permute(0, 3, 1, 2).contiguous()
+                pixel_values = pixel_values / 255.
+                union_mouth_masks = torch.from_numpy(example["union_mouth_masks"]).permute(0, 3, 1, 2).contiguous()
+                union_mouth_masks = union_mouth_masks / 255.
                 if args.random_ratio_crop:
-                    # To 0~1
-                    pixel_values = torch.from_numpy(example["pixel_values"]).permute(0, 3, 1, 2).contiguous()
-                    pixel_values = pixel_values / 255.
-
                     # Get adapt hw for resize
                     b, c, h, w = pixel_values.size()
                     th, tw = random_sample_size
@@ -1249,11 +1254,8 @@ def main():
                         transforms.CenterCrop([int(x) for x in random_sample_size]),
                         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
                     ])
+                    transform_mask = transform
                 else:
-                    # To 0~1
-                    pixel_values = torch.from_numpy(example["pixel_values"]).permute(0, 3, 1, 2).contiguous()
-                    pixel_values = pixel_values / 255.
-
                     # Get adapt hw for resize
                     closest_size = list(map(lambda x: int(x), closest_size))
                     if closest_size[0] / h > closest_size[1] / w:
@@ -1266,7 +1268,13 @@ def main():
                         transforms.CenterCrop(closest_size),
                         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
                     ])
+                    transform_mask = transforms.Compose([
+                        transforms.Resize(resize_size, interpolation=transforms.InterpolationMode.NEAREST),  # Image.NEAREST
+                        transforms.CenterCrop(closest_size),
+                        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+                    ])
                 new_examples["pixel_values"].append(transform(pixel_values))
+                new_examples["union_mouth_masks"].append(transform(union_mouth_masks))
                 new_examples["text"].append(example["text"])
 
                 batch_video_length = int(min(batch_video_length, len(pixel_values)))
@@ -1291,6 +1299,7 @@ def main():
 
             # Limit the number of frames to the same
             new_examples["pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["pixel_values"]])
+            new_examples["union_mouth_masks"] = torch.stack([example[:batch_video_length] for example in new_examples["union_mouth_masks"]])
             if args.train_mode != "normal":
                 new_examples["mask_pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["mask_pixel_values"]])
                 new_examples["mask"] = torch.stack([example[:batch_video_length] for example in new_examples["mask"]])
@@ -1470,15 +1479,17 @@ def main():
                 os.makedirs(os.path.join(args.output_dir, "sanity_check"), exist_ok=True)
                 for idx, (pixel_value, text) in enumerate(zip(pixel_values, texts)):
                     pixel_value = pixel_value[None, ...]
-                    gif_name = '-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_step}-{idx}'
-                    save_videos_grid(pixel_value, f"{args.output_dir}/sanity_check/{gif_name[:10]}.gif", rescale=True)
+                    # gif_name = '-'.join(text.replace('/', '').split()[:10]) if not text == '' else f'{global_step}-{idx}'
+                    save_name = f"{global_step}-{idx}.mp4"
+                    save_videos_grid(pixel_value, f"{args.output_dir}/sanity_check/{save_name}", rescale=True)
                 if args.train_mode != "normal":
                     clip_pixel_values, mask_pixel_values, texts = batch['clip_pixel_values'].cpu(), batch['mask_pixel_values'].cpu(), batch['text']
                     mask_pixel_values = rearrange(mask_pixel_values, "b f c h w -> b c f h w")
                     for idx, (clip_pixel_value, pixel_value, text) in enumerate(zip(clip_pixel_values, mask_pixel_values, texts)):
                         pixel_value = pixel_value[None, ...]
-                        Image.fromarray(np.uint8(clip_pixel_value)).save(f"{args.output_dir}/sanity_check/clip_{gif_name[:10] if not text == '' else f'{global_step}-{idx}'}.png")
-                        save_videos_grid(pixel_value, f"{args.output_dir}/sanity_check/mask_{gif_name[:10] if not text == '' else f'{global_step}-{idx}'}.gif", rescale=True)
+                        save_name = f"{global_step}-{idx}.mp4"
+                        Image.fromarray(np.uint8(clip_pixel_value)).save(f"{args.output_dir}/sanity_check/clip_{global_step}-{idx}.png")
+                        save_videos_grid(pixel_value, f"{args.output_dir}/sanity_check/mask_{global_step}-{idx}.mp4", rescale=True)
 
             with accelerator.accumulate(transformer3d):
                 # Convert images to latent space

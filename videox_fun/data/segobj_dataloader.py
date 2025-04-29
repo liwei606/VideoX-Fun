@@ -117,12 +117,10 @@ class LiveVideoDataset(Dataset):
         super().__init__()
         self.cfg = cfg
         self.save_gt = save_gt
-        self.img_size = (height, width)
-        self.width = width
-        self.height = height
         self.split = split
         self.drop_n_frame = 3 # drop first and last [drop_n_frame] frame to filter out unreasonable scene transition
         self.zero_to_one = self.cfg.data.get('zero_to_one', False)
+        self.yolo_object_conf = self.cfg.data.get("yolo_object_conf", 0.45)
         self.clip_object_sim_up = self.cfg.data.get("clip_object_sim_up", 0.95)
         self.clip_object_sim_down = self.cfg.data.get("clip_object_sim_down", 0.75)
         self.arc_face_sim_down = self.cfg.data.get("arc_face_sim_down", 0.75)
@@ -132,7 +130,6 @@ class LiveVideoDataset(Dataset):
             cache_file_path_list = cfg.data.get("cache_file_path", [])
             self.n_sample_frames = cfg.data.n_sample_frames
             self.past_n = cfg.data.past_n
-            self.union_bbox_scale = self.cfg.data.union_bbox_scale
             self.flip_aug = self.cfg.data.get('flip_aug', False)
             self.resume_step = resume_step
         else: 
@@ -140,7 +137,6 @@ class LiveVideoDataset(Dataset):
             cache_file_path_list = []
             self.n_sample_frames = cfg.val_data.n_sample_frames
             self.past_n = cfg.val_data.past_n
-            self.union_bbox_scale = self.cfg.val_data.union_bbox_scale
             self.flip_aug = self.cfg.val_data.get('flip_aug', False)
             self.resume_step = 0
         
@@ -161,7 +157,6 @@ class LiveVideoDataset(Dataset):
             print('Debug Mode!!!')
 
         self.target_fps = cfg.data.train_fps
-        self.random_sample = cfg.data.random_sample
         print(f"origin {len(vid_path)=}")
         
         if split == 'train':
@@ -172,39 +167,6 @@ class LiveVideoDataset(Dataset):
             if "pose_delta" in cfg.data: del cfg.data["pose_delta"]
             print(f"{self.dataset[::5]=}")
         print(f"finish repeat vid_path{len(self.dataset)=}")
-        
-        self.pixel_transform = transforms.Compose(
-            [    
-                transforms.Resize(self.img_size, interpolation=transforms.InterpolationMode.BICUBIC), 
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-
-        self.pixel_norm = transforms.Compose(
-            [   
-                
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-                
-            ]
-        )
-        
-        if 'color_jitter' in cfg.data and cfg.data.color_jitter: 
-            self.color_jitter = ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1)
-        else:
-            self.color_jitter = None
-
-    def augmentation(self, images, transform, state=None):
-        if state is not None:
-            torch.set_rng_state(state)
-        
-        if isinstance(images, List):
-            transformed_images = [transform(Image.fromarray(img))[None] for img in images]
-            transformed_images = torch.cat(transformed_images)
-            return transformed_images  # (f, c, h, w)
-        else:
-            return transform(Image.fromarray(images))  # (c, h, w)
 
     def __len__(self):
         return len(self.dataset)
@@ -238,7 +200,7 @@ class LiveVideoDataset(Dataset):
             for track_id, sync_results in video_sync_results.items():
                 meets_thresh = (
                     abs(sync_results["offset"]) <= self.cfg.data.get("audio_offset_thresh", 100)
-                    and abs(sync_results["conf"]) >= self.cfg.data.get("audio_conf_thresh", 1)
+                    and abs(sync_results["conf"]) >= self.cfg.data.get("audio_conf_thresh", 0)
                 )
                 if meets_thresh:
                     valid_face_ids.append(track_id)
@@ -364,13 +326,15 @@ class LiveVideoDataset(Dataset):
                 other_metadata_file = f"{folder}/metadata/{other_name}/metadata.pkl"
             with open(other_metadata_file, 'rb') as f:
                 other_video_metadata = pickle.load(f)
+            other_xy = other_video_metadata["objs_segments"][other_frame_idx][other_obj_idx]
+            other_boxes = other_video_metadata["objs_boxes"][other_frame_idx][other_obj_idx]
+            if other_boxes[4] < self.yolo_object_conf: continue
             other_frame = VideoReader(other_vid_path, ctx=cpu(0))[other_frame_idx].asnumpy()
             ohd, owd, _ = other_frame.shape
-            other_xy = other_video_metadata["objs_segments"][other_frame_idx][other_obj_idx]
             polygon_coco = [other_xy.flatten().tolist()]
             other_object = other_frame * polygons_to_mask(polygon_coco, ohd, owd)[:, :, None]
             object_refers.append(other_object)
-            
+        
         face_refers = []
         for face_select_key, face_select_dict in face_select_dict.items():
             cut_name, other_frame_idx, other_face_id = face_select_dict
@@ -386,7 +350,9 @@ class LiveVideoDataset(Dataset):
             x_min, y_min, x_max, y_max = other_video_metadata["frame_data"]["bounding_box"][other_face_id][other_frame_idx]
             other_face = other_frame[int(y_min):int(y_max), int(x_min):int(x_max)]
             face_refers.append(other_face)
-            
+        
+        assert len(object_refers) > 0, "No reference object found"
+        assert len(face_refers) > 0, "No reference face found"
                         
         # Read target frames
         def get_imgs_from_idx(idx):
@@ -403,6 +369,11 @@ class LiveVideoDataset(Dataset):
             vid_pil_image_past = get_imgs_from_idx(past_batch_index)
             vid_pil_image_list = get_imgs_from_idx(tgt_batch_index)
 
+        clip_st = target_frame_indices_new[past_batch_index[0]] / original_fps
+        clip_et = target_frame_indices_new[tgt_batch_index[-1]] / original_fps
+        wav_st = int(clip_st * target_fps)
+        wav_et = int(clip_et * target_fps)
+        
         for vid_pil_image in vid_pil_image_list:
             assert np.array(vid_pil_image).mean() >= 0.2, "Meet all black frames, skip It !!!"
 
@@ -422,92 +393,15 @@ class LiveVideoDataset(Dataset):
         sample = dict(
             video_path = video_path,
             pixel_values = pixel_values,
-            face_refers = face_refers,
-            object_refers = object_refers,
+            face_refers = np.array(face_refers),
+            object_refers = np.array(object_refers),
             text = "",
             data_type = data_type,
             idx = index,
-            
+            clip_st=clip_st,
+            clip_et=clip_et,
         )
 
-        # FLIP_FLAG = False
-        # if self.flip_aug and random.random() < 0.5:
-        #     vid_pil_image_list = [np.flip(img, axis=1).copy() for img in vid_pil_image_list]
-        #     vid_pil_image_past = [np.flip(img, axis=1).copy() for img in vid_pil_image_past]
-        #     # union_mask_img = np.flip(union_mask_img, axis=1).copy()
-        #     FLIP_FLAG = True
-        
-        # Transform
-        # state = torch.get_rng_state()
-
-        # pixel_values_vid_original = self.augmentation(vid_pil_image_list, self.pixel_transform, state)
-        # pixel_values_past_frames_original = self.augmentation(vid_pil_image_past, self.pixel_transform, state)
-        # if len(object_refers) == 0:
-        #     object_refers = [np.zeros_like(vid_pil_image_list[0])]
-        # if len(face_refers) == 0:
-        #     face_refers = [np.zeros_like(vid_pil_image_list[0])]
-        # pixel_values_object_refers = self.augmentation(object_refers, self.pixel_transform, state)
-        # pixel_values_face_refers = self.augmentation(face_refers, self.pixel_transform, state)
-        
-
-        # assert pixel_values_vid_original.min() < 0 and pixel_values_vid_original.max() <= 1
-        # assert pixel_values_past_frames_original.min() < 0 and pixel_values_past_frames_original.max() <= 1
-        
-        # # Make sure this feature is right: Get target wav features
-
-        # clip_st = target_frame_indices_new[past_batch_index[0]] / original_fps
-        # clip_et = target_frame_indices_new[tgt_batch_index[-1]] / original_fps
-        # wav_st = int(clip_st * target_fps)
-        # wav_et = int(clip_et * target_fps)
-        
-        # ## Add wav_feat here
-        # # if wav_et >= len(wav_fea):
-        # #     wav_et = len(wav_fea)
-        # # target_wav_fea = wav_fea[wav_et - self.n_sample_frames : wav_et]
-        # assert len(pixel_values_vid_original) == self.n_sample_frames and len(pixel_values_past_frames_original) == self.past_n, \
-        #     "pixel_values cannot meet length threshold"
-        
-        # if os.path.exists(video_path.replace("mp4", "wav")):
-        #     gt_filt_audio = video_path.replace("mp4", "wav")
-        # elif os.path.exists(video_path.replace("+resampled.mp4", "+audio.wav")):
-        #     gt_filt_audio = video_path.replace("+resampled.mp4", "+audio.wav")
-        # else:
-        #     gt_filt_audio = video_path.replace("+resampled.mp4", "+audiov4.wav")
-        # sample = dict(
-        #     video_path=video_path,
-        #     pixel_values_vid_original=pixel_values_vid_original,
-        #     pixel_values_past_frames_original=pixel_values_past_frames_original,
-        #     pixel_values_object_refers=pixel_values_object_refers,
-        #     pixel_values_face_refers=pixel_values_face_refers,
-            
-        # )
-
-        # if self.save_gt:
-        #     if os.path.exists(video_path.replace("mp4", "wav")):
-        #         gt_filt_audio = video_path.replace("mp4", "wav")
-        #     elif os.path.exists(video_path.replace("+resampled.mp4", "+audio.wav")):
-        #         gt_filt_audio = video_path.replace("+resampled.mp4", "+audio.wav")
-        #     else:
-        #         gt_filt_audio = video_path.replace("+resampled.mp4", "+audiov4.wav")
-        #     audio_self_path = ""
-        #     audio_other_path = ""
-        #     if "face_id_pair_audiov3" in video_metadata:
-        #         face_audio_pair = video_metadata["face_id_pair_audiov3"]
-        #         self_face_id, other_face_id = face_audio_pair.keys()
-        #         if face_id != self_face_id:
-        #             self_face_id, other_face_id = other_face_id, self_face_id
-        #         audio_self_path = video_path.replace("+resampled.mp4", f"+audio_v3_{self_face_id}.wav")
-        #         audio_other_path = video_path.replace("+resampled.mp4", f"+audio_v3_{other_face_id}.wav")
-        #     sample.update(
-        #         dict(
-        #             video_path=video_path,
-        #             audio_path=gt_filt_audio,
-        #             audio_self_path=audio_self_path,
-        #             audio_other_path=audio_other_path,
-        #             clip_st=clip_st,
-        #             clip_et=clip_et,
-        #         )
-        #     )
 
         return sample
 
@@ -525,6 +419,10 @@ class LiveVideoDataset(Dataset):
                 # You can optionally log the error here
                 skip_index = index
                 print(f"Skipping index {skip_index} due to: {str(e)}")
+                if "The truth value of an array with more than one element is ambiguous" in str(e):
+                    import traceback;traceback.print_exc()
+                if "setting an array element with a sequence. The requested array has an inhomogeneous shape after" in str(e):
+                    import traceback;traceback.print_exc()
                 # Return None, which will be filtered out by the collate_fn
                 # return None
                 index = np.random.randint(0, len(self))
@@ -533,9 +431,10 @@ class LiveVideoDataset(Dataset):
 # You can
 import argparse
 import os, shutil
+import imageio
 from tqdm import tqdm
 from einops import rearrange
-from lightning import seed_everything
+from accelerate.utils import set_seed
 if __name__ == "__main__":
     # RUN_FUNC = os.environ["RUN_FUNC"]
     # RUN_FUNC = 'test_fast_video_dataset'
@@ -544,105 +443,54 @@ if __name__ == "__main__":
     # /home/weili/miniconda3/envs/wan21_xc/bin/python 
     #    videox_fun/data/segobj_dataloader.py 
     #    --dataset_file_path 
-    #    --visual_type norm cache
-    #    --n_sample_frames 77
-    #    --past_n 4 or default=4
-    #    --train_fps 25 or default=8
-    #    --save_fps 1 or train_fps
-    #    --get_data_type animation
-    #    --seed 
-    #    --past_frame_is_ref 
-    #    --ignore_hope # if haven't process this params, store true to ignore it !
-    #    --ignore_hyperIQA # if haven't process this params, store true to ignore it !
-    #    --driving_video_scale 1.65
-    #    --lip_open_ratio 0.
-    #    --hyperIQA_min 0. # suggest 45
-    #    --audio_dyadic_conf_thresh 0 # suggest 6 for dyadic
-    #    --num_workers default=32
+
+    #    visual data ----------------------------
+    #    --save_fps
+    #    --save_origin_video 
+
+    #    video dataloader args ------------------------------------------------
+    #    --n_sample_frames default 77 
+    #    --past_n default 4
+    #    --train_fps default 25
+    #    --num_workers default=24
     #    --no_save_visual
     #    --save_origin_video
-    #    --save_split # store true, suggest for dyadic
-    #    --save_lip_visual # visual lip movements value
-
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_file_path", type=str, required=True)
-    parser.add_argument("--visual_type", type=str, default="norm")
-    parser.add_argument("--train_width", type=int, default=544)
-    parser.add_argument("--train_height", type=int, default=960)
-
+    parser.add_argument("--seed", type=int, default=42)
+    # cache data or visual data ----------------------------------------
+    parser.add_argument("--no_save_visual", action="store_true")
+    parser.add_argument("--save_fps", type=int, default=None)
+    parser.add_argument("--save_origin_video", action="store_true")
+    # video dataloader args ------------------------------------------------
     parser.add_argument("--n_sample_frames", type=int, default=77)
     parser.add_argument("--past_n", type=int, default=4)
     parser.add_argument("--train_fps", type=int, default=25)
-    parser.add_argument("--save_fps", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=42)
-    
-    parser.add_argument("--past_frame_is_ref", action="store_true")
-    
-    parser.add_argument("--ignore_hope", action="store_true")
-    parser.add_argument("--ignore_hyperIQA", action="store_true")
-    parser.add_argument("--hyperIQA_min", type=float, default=0)
-    parser.add_argument("--lip_open_ratio", type=float, default=0)
-    parser.add_argument("--audio_dyadic_conf_thresh", type=float, default=0)
-
-    parser.add_argument("--get_data_type", type=str, default="animation")
-    parser.add_argument("--no_save_visual", action="store_true")
-    parser.add_argument("--save_origin_video", action="store_true")
-    parser.add_argument("--save_split", action="store_true")
-    parser.add_argument("--save_lip_visual", action="store_true")
-    
-    # Parameters to sample video -----------------------------
-    parser.add_argument("--driving_video_scale", type=float, default=1.65)
-    parser.add_argument("--yaw_max", type=float, default=45)
-    parser.add_argument("--pitch_max", type=float, default=40)
-    parser.add_argument("--roll_max", type=float, default=30)
-    parser.add_argument("--yaw_delta", type=float, default=40)
-    parser.add_argument("--pitch_delta", type=float, default=25)
-    parser.add_argument("--roll_delta", type=float, default=20)
-    
-    parser.add_argument("--num_workers", type=int, default=32)
+    # other args
+    parser.add_argument("--num_workers", type=int, default=24)
 
     args = parser.parse_args()
     
     if args.save_fps is None: args.save_fps = args.train_fps
         
-    config = "/mnt/weka/hw_workspace/sr_workspace/real-time-video-gen/configs/train/head_animator_mix_LIA_visual.yaml"
-    config = OmegaConf.load(config)
-    seed_everything(args.seed)
-    if args.visual_type == "norm":
-        # visual norm data
-        dataset_file_path = args.dataset_file_path
-        visual_dir_name = "SEGOBJECT_" + os.path.basename(dataset_file_path)[:-4]
-        config["data"]["dataset_file_path"] = [[dataset_file_path, 1]]
-        
-    if args.visual_type == "cache":
-        # visual cache data
-        cache_file_path = args.dataset_file_path
-        visual_dir_name = "SEGOBJECT_" + os.path.basename(cache_file_path)
-        config["data"]["dataset_file_path"] = []
-        config["data"]["cache_file_path"] = [[cache_file_path, 1]]
-    config["data"]["train_width"] = args.train_width
-    config["data"]["train_height"] = args.train_height
-
+    # config = "configs/train/head_animator_mix_LIA_visual.yaml"
+    # config = OmegaConf.load(config)
+    config = {"data": {}}
+    set_seed(args.seed)
+    # visual norm data
+    dataset_file_path = args.dataset_file_path
+    visual_dir_name = "SEGOBJECT_" + os.path.basename(dataset_file_path)[:-4]
+    config["data"]["dataset_file_path"] = [[dataset_file_path, 1]]
+    
     config["data"]["n_sample_frames"] = args.n_sample_frames
     config["data"]["past_n"] = args.past_n
     config["data"]["train_fps"] = args.train_fps
-    config["data"]["visual_dir"] = visual_dir_name
-    config["data"]["driving_video_scale"] = args.driving_video_scale
-    config["data"]["pose_max"] = [args.yaw_max, args.pitch_max, args.roll_max]
-    config["data"]["pose_delta"] = [args.yaw_delta, args.pitch_delta, args.roll_delta]
-    config["data"]["past_frame_is_ref"] = args.past_frame_is_ref
-    config["data"]["lip_open_ratio"] = args.lip_open_ratio
-    config["data"]["hyperIQA_min"] = args.hyperIQA_min
-    config["data"]["audio_dyadic_conf_thresh"] = args.audio_dyadic_conf_thresh
-    config["data"]["get_data_type"] = args.get_data_type
-    if args.ignore_hope:
-        del config["data"]["pose_max"], config["data"]["pose_delta"]
-    if args.ignore_hyperIQA:
-        del config["data"]["hyperIQA_min"]
+    
+    config = OmegaConf.create(config)
+    set_seed(args.seed)
+        
     train_dataset = LiveVideoDataset(
-        width=config.data.train_width,
-        height=config.data.train_height,
         cfg=config,
         split='train',
         resume_step=0,
@@ -675,7 +523,7 @@ if __name__ == "__main__":
             return None
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=config.data.train_bs,
+        batch_size=1,
         shuffle=True,
         collate_fn=custom_collate_fn,
         num_workers=args.num_workers,
@@ -686,123 +534,44 @@ if __name__ == "__main__":
     )
     for i, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
         # continue
-        # del batch["video_path"]
-        # for k, v in batch.items():
-        #     print(k, v.shape, v.unique())
-        # exit(0)
-        # when not zero_to_one, all of bellow is [-1, 1]
 
-        target_vid_original = batch['pixel_values']
-        # past_frames = batch['pixel_values_past_frames_original']
-        object_refers = batch["face_refers"]
-        face_refers = batch["object_refers"]
-        # target_vid_original = torch.cat([past_frames, target_vid_original], dim=1)
-        
-        face_refer = face_refers[:, 0, ...][:,None].repeat(1, target_vid_original.size(1), 1, 1, 1)
-        face_refer = rearrange(face_refer, "b t c h w -> (b t) c h w")
-        object_refers_vis = []
-        for object_refer in object_refers:
-            object_refer = object_refer[:,None].repeat(1, target_vid_original.size(1), 1, 1, 1)
-            object_refer = rearrange(object_refer, "b t c h w -> (b t) c h w")
-            object_refers_vis.append(object_refer)
-        
-        target_vid_original = rearrange(target_vid_original, "b t c h w -> (b t) c h w")
-        
-
-        # ref_img_original = ref_img_original[:,None].repeat(1, target_vid_original.size(1), 1, 1, 1)
-        # ref_img_original = rearrange(ref_img_original, "b t c h w -> (b t) c h w")
-        # target_vid_original = rearrange(target_vid_original, "b t c h w -> (b t) c h w")
-
-        
+        target_vid_original = batch['pixel_values'][0]
+        face_refers = batch["face_refers"][0]
+        object_refers = batch["object_refers"][0]
+        object_refers = object_refers[:5]
+                
         video_path = batch["video_path"][0]
-        audio_path = batch["audio_path"][0]
-        clip_st = batch["clip_st"][0]
-        clip_et = batch["clip_et"][0]
-        audio_self_path = batch["audio_self_path"][0]
-        audio_other_path = batch["audio_other_path"][0]
+        clip_st = batch["clip_st"][0].cpu().item()
+        clip_et = batch["clip_et"][0].cpu().item()
         print(f"{video_path=}")
-        print(f"{audio_self_path=}")
-        print(f"{audio_other_path=}")
         
-        import imageio
         visual_list = []
         ref_img_original_vis = None
         target_vid_original_vis = []
         masked_ref_img_vis = None
         masked_target_vid_vis = []
         for j, (
-            # ref_img_original_i, 
             target_vid_original_i, 
-            face_refer_i
             ) \
             in enumerate(zip(
-                #    ref_img_original, 
                    target_vid_original, 
-                   face_refer,
                    )):
-            # target_vid_original_i = (((target_vid_original_i.cpu().numpy() + 1.) / 2.) * 255.).transpose(1, 2, 0).astype("uint8")
-            # object_refer_i = [(((object_refer[j].cpu().numpy() + 1.) / 2.) * 255.).transpose(1, 2, 0).astype("uint8") for object_refer in object_refers_vis]
-            # face_refer_i = (((face_refer_i.cpu().numpy() + 1.) / 2.) * 255.).transpose(1, 2, 0).astype("uint8")
+
             target_vid_original_i = target_vid_original_i.cpu().numpy().astype("uint8")
-            object_refer_i = [object_refer[j].cpu().numpy().astype("uint8") for object_refer in object_refers_vis]
-            face_refer_i = face_refer_i.cpu().numpy().astype("uint8")
+            object_refer_i = [object_refer.cpu().numpy().astype("uint8") for object_refer in object_refers]
+            face_refer_i = face_refers[0].cpu().numpy().astype("uint8")
+            face_and_obj = [face_refer_i] + object_refer_i
+            save_h, save_w, _ = target_vid_original_i.shape
+            face_and_obj = [np.array(Image.fromarray(x).resize((save_w, save_h))) for x in face_and_obj]
                 
-            visuals = np.concatenate([
-                                      target_vid_original_i, 
-                                      face_refer_i
-                                    ] + object_refer_i, axis=1)
+            visuals = np.concatenate([target_vid_original_i] + face_and_obj, axis=1)
             visual_list.append(visuals)
         
-        if args.visual_type == "norm":
-            video_base = os.path.basename(video_path)[:-4]
-            save_path = f"./{config.data.visual_dir}/{i}_{video_base}.mp4"
-        if args.visual_type == "cache":
-            video_base, video_times = os.path.basename(str(Path(video_path).parent)), os.path.basename(video_path)
-            save_path = f"./{config.data.visual_dir}/{i}_{video_base}_{video_times}.mp4"
-        os.makedirs(config.data.visual_dir, exist_ok=True)
+        video_base = os.path.basename(video_path)[:-4]
+        save_path = f"./{visual_dir_name}/{i}_{video_base}.mp4"
+
+        os.makedirs(visual_dir_name, exist_ok=True)
         if args.save_origin_video:
-            shutil.copy(video_path, config.data.visual_dir)
+            shutil.copy(video_path, visual_dir_name)
         if not args.no_save_visual:
             imageio.mimwrite(save_path, visual_list, fps=config.data.train_fps)
-        if args.save_lip_visual:
-            lip_visuals = []
-            for frame, batch_lip_movement in zip(visual_list, batch_lip_movements):
-                draw_frame = frame.copy()
-                cv2.putText(draw_frame, str(batch_lip_movement.item()), (20, 0 * 100 + 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 2, (200, 0, 200), 2)
-                lip_visuals.append(draw_frame)
-            save_path = f"./{config.data.visual_dir}/{i}_{video_base}_lip_visual.mp4"
-            imageio.mimwrite(save_path, lip_visuals, fps=config.data.train_fps)
-            
-        if args.save_split:
-            Image.fromarray(ref_img_original_vis).save(f"./{config.data.visual_dir}/{i}_{video_base}_ref_img.png")
-            Image.fromarray(masked_ref_img_vis).save(f"./{config.data.visual_dir}/{i}_{video_base}_masked_ref.png")
-            target_vid_save_path_tmp = f"./{config.data.visual_dir}/{i}_{video_base}_target_vid_no_audio.mp4"
-            target_vid_save_path = f"./{config.data.visual_dir}/{i}_{video_base}_target_vid.mp4"
-            imageio.mimwrite(target_vid_save_path_tmp,
-                             target_vid_original_vis,
-                             fps=config.data.train_fps)
-            imageio.mimwrite(f"./{config.data.visual_dir}/{i}_{video_base}_masked_target_vid.mp4",
-                             masked_target_vid_vis,
-                             fps=config.data.train_fps)
-            
-            audio_clip_path = f"./{config.data.visual_dir}/{i}_{video_base}.wav"
-            ffmpeg.input(audio_path, ss=clip_st, to=clip_et).audio.output(audio_clip_path).run()
-            if audio_self_path != "":
-                audio_self_clip_path = f"./{config.data.visual_dir}/{i}_{video_base}_self.wav"
-                ffmpeg.input(audio_self_path, ss=clip_st, to=clip_et).audio.output(audio_self_clip_path).run()
-            if audio_other_path != "":
-                audio_other_clip_path = f"./{config.data.visual_dir}/{i}_{video_base}_other.wav"
-                ffmpeg.input(audio_other_path, ss=clip_st, to=clip_et).audio.output(audio_other_clip_path).run()
-            
-            ffmpeg.output(
-                (ffmpeg.input(target_vid_save_path_tmp)).video,
-                (ffmpeg.input(audio_clip_path)).audio,
-                target_vid_save_path,
-                vcodec="copy",
-                acodec="aac",
-                shortest=None,
-                loglevel="error",
-            ).run()
-            os.remove(target_vid_save_path_tmp)
-        # visual -----------------------------------

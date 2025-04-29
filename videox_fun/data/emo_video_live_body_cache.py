@@ -177,9 +177,31 @@ def overlap_face(hands_boxes_cur, det):
         overlap_sum_value += overlap_area / area_face
     return overlap_sum_value >= 0.01
 
+# def get_subtitle(text_boxes, len_text_boxes, video_height):
+#     min_height_ratio=0.05
+#     max_height_ratio=0.45
+
+#     upper_half_y_threshold = video_height * 0.2
+#     lower_half_y_threshold = video_height * 0.6
+
+#     text_detections = []
+#     for box in text_boxes:
+#         x_min, y_min, x_max, y_max = box
+#         y_center = (y_min + y_max) / 2
+
+#         height = y_max - y_min
+#         width = x_max - x_min
+    
+#         if ((y_center > lower_half_y_threshold or y_center < upper_half_y_threshold) and 
+#             height / video_height < max_height_ratio and 
+#             width / height > 2):
+#             text_detections.append(box)
+
+#     return text_detections
+
 def get_subtitle(text_boxes, len_text_boxes, video_height):
     min_height_ratio=0.05
-    max_height_ratio=0.45
+    max_height_ratio=0.2
 
     upper_half_y_threshold = video_height * 0.2
     lower_half_y_threshold = video_height * 0.6
@@ -192,12 +214,12 @@ def get_subtitle(text_boxes, len_text_boxes, video_height):
         height = y_max - y_min
         width = x_max - x_min
     
-        if ((y_center > lower_half_y_threshold or y_center < upper_half_y_threshold) and 
+        if ((y_min > lower_half_y_threshold or y_max < upper_half_y_threshold) and 
             height / video_height < max_height_ratio and 
-            width / height > 2):
+            width / height > 4):
             text_detections.append(box)
 
-    return text_detections                
+    return text_detections     
 
 def get_random_mask(shape, image_start_only=False):
     f, c, h, w = shape
@@ -1057,13 +1079,13 @@ class LiveVideoDataset(Dataset):
         vid_pil_image_past = [crop_image_by_bbox(np.array(img), crop_bbox, dsize=cur_img_size) for img in vid_pil_image_past]
         # union_mask_img = crop_image_by_bbox(np.array(union_mask_img), crop_bbox, size=self.cfg.data.train_width)
 
-        FLIP_FLAG = False
-        if self.flip_aug and random.random() < 0.5:
-            ref_img = np.flip(ref_img, axis=1).copy()
-            vid_pil_image_list = [np.flip(img, axis=1).copy() for img in vid_pil_image_list]
-            vid_pil_image_past = [np.flip(img, axis=1).copy() for img in vid_pil_image_past]
-            # union_mask_img = np.flip(union_mask_img, axis=1).copy()
-            FLIP_FLAG = True
+        # FLIP_FLAG = False
+        # if self.flip_aug and random.random() < 0.5:
+        #     ref_img = np.flip(ref_img, axis=1).copy()
+        #     vid_pil_image_list = [np.flip(img, axis=1).copy() for img in vid_pil_image_list]
+        #     vid_pil_image_past = [np.flip(img, axis=1).copy() for img in vid_pil_image_past]
+        #     # union_mask_img = np.flip(union_mask_img, axis=1).copy()
+        #     FLIP_FLAG = True
         
         # Transform
         # state = torch.get_rng_state()
@@ -1086,8 +1108,9 @@ class LiveVideoDataset(Dataset):
             data_type=data_type,
             pixel_values_vid_original=np.array(vid_pil_image_list),
             pixel_values_past_frames_original=np.array(vid_pil_image_past),
-            clip_st=clip_st,
-            clip_et=clip_et,
+            face_id=face_id,
+            crop_bbox=crop_bbox,
+            clip_target_idx=target_frame_indices_new[past_batch_index + tgt_batch_index],
         )
         # for pixel_values_vid_original_i, vid_pil_image in zip(pixel_values_vid_original, vid_pil_image_list):
         #     if (pixel_values_vid_original_i * 255).mean() <= 1 or vid_pil_image.mean() <= 1: 
@@ -1408,8 +1431,9 @@ class LiveVideoDataset(Dataset):
             "video_path": process_dict["video_path"],
             "folder": process_dict["folder"],
             "name": process_dict["name"],
-            "clip_st": process_dict["clip_st"],
-            "clip_et": process_dict["clip_et"],
+            "face_id": process_dict["face_id"],
+            "crop_bbox": process_dict["crop_bbox"],
+            "clip_target_idx": process_dict["clip_target_idx"],
         }
         if not self.enable_bucket:
             state = torch.get_rng_state()
@@ -1443,7 +1467,7 @@ class LiveVideoDataset(Dataset):
                 # import traceback;traceback.print_exc()
                 # You can optionally log the error here
                 skip_index = (index + self.resume_step) % len(self)
-                # print(f"Skipping index {skip_index} due to: {str(e)}")
+                print(f"Skipping index {skip_index} due to: {str(e)}")
                 # Return None, which will be filtered out by the collate_fn
                 # return None
                 index = np.random.randint(0, len(self))
@@ -1494,12 +1518,11 @@ if __name__ == "__main__":
     # save_visual is default mode, save visual video, mask and i2v condition
     # /home/weili/miniconda3/envs/wan21_xc/bin/python 
     #    videox_fun/data/emo_video_live_body_cache.py 
-    #    --dataset_file_path 
+    #    save cache ---------------------------------------------
+    #    --save_cache --no_save_visual --dataset_file_path 
 
     #    save cache, not visual data ----------------------------
-    #    --no_save_visual
-    #    --save_cache 
-    #    --save_dir /mnt/weka/training_data_xc/RealTime4K_cache/
+    #    --save_dir /home/weili/RealTimeV3Cache/20250429/
     #    --seed default 42
     #    --sample_times 3
     #    --start_id 0
@@ -1514,7 +1537,6 @@ if __name__ == "__main__":
     #    --n_sample_frames default 77 
     #    --past_n default 4
     #    --train_fps default 25
-    #    --ignore_hope # if haven't process this params, store true to ignore it !
     #    --ignore_hyperIQA # if haven't process this params, store true to ignore it !
     #    --driving_video_scale default 1.2
     #    --vx_ratio_crop default -0.20
@@ -1534,7 +1556,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_file_path", type=str, required=True)
     parser.add_argument("--seed", type=int, default=42)
     # cache data or visual data ----------------------------------------
-    parser.add_argument("--save_dir", type=str, required=True)
+    parser.add_argument("--save_dir", type=str, default="")
     parser.add_argument("--start_id", type=int, default=0)
     parser.add_argument("--end_id", type=int, default=-1)
     parser.add_argument("--sample_times", type=int, default=3)
@@ -1554,7 +1576,6 @@ if __name__ == "__main__":
     parser.add_argument("--vx_ratio_crop", type=float, default=-0.20)
     parser.add_argument("--vy_ratio_crop", type=float, default=0)
     # HopeNet args
-    parser.add_argument("--ignore_hope", action="store_true")
     parser.add_argument("--yaw_max", type=float, default=45)
     parser.add_argument("--pitch_max", type=float, default=40)
     parser.add_argument("--roll_max", type=float, default=30)
@@ -1584,7 +1605,7 @@ if __name__ == "__main__":
     set_seed(args.seed)
     # visual norm data
     dataset_file_path = args.dataset_file_path
-    visual_dir_name = "live_" + os.path.basename(dataset_file_path)[:-4]
+    visual_dir_name = "liveBody_" + os.path.basename(dataset_file_path)[:-4]
     config["data"]["dataset_file_path"] = [[dataset_file_path, 1]]
     
     config["data"]["train_width"] = args.train_width
@@ -1610,8 +1631,7 @@ if __name__ == "__main__":
     config["data"]["body_level"] = args.body_level
     
     config["data"]["audio_dyadic_conf_thresh"] = args.audio_dyadic_conf_thresh
-    if args.ignore_hope:
-        del config["data"]["pose_max"], config["data"]["pose_delta"]
+    del config["data"]["pose_max"], config["data"]["pose_delta"]
     if args.ignore_hyperIQA:
         del config["data"]["hyperIQA_min"]
     config = OmegaConf.create(config)
@@ -1677,8 +1697,9 @@ if __name__ == "__main__":
         folder = batch["folder"][0]
         name = batch["name"][0]
         pixel_values = batch["pixel_values"][0]
-        clip_st = batch["clip_st"][0].cpu().item()
-        clip_et = batch["clip_et"][0].cpu().item()
+        face_id = batch["face_id"][0].cpu().item()
+        crop_bbox = batch["crop_bbox"][0].cpu().numpy()
+        clip_target_idx = batch["clip_target_idx"][0].cpu().numpy()
         if not args.no_save_visual:
             save_dir = visual_dir_name + f"_{args.driving_video_scale}"
             os.makedirs(save_dir, exist_ok=True)
@@ -1736,11 +1757,11 @@ if __name__ == "__main__":
             meta_result = {
                 "height": height,
                 "width": width,
-                # "video_path": video_path,
                 "folder": folder,
                 "name": name,
-                "clip_st": clip_st,
-                "clip_et": clip_et,
+                "face_id": face_id,
+                "crop_bbox": crop_bbox,
+                "clip_target_idx": clip_target_idx,
             }
             func_args = (pixel_values, v2i_dir, save_dir_item, meta_result)
             writer_result = writer_pool.apply_async(save_video_as_image, args=(func_args,))
