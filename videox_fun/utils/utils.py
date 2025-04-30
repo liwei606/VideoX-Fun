@@ -4,6 +4,7 @@ import imageio
 import inspect
 import numpy as np
 import torch
+import time
 import torchvision
 import cv2
 import asyncio
@@ -258,6 +259,15 @@ def get_image_latent(ref_image=None, sample_size=None):
 
     return ref_image
 
+
+def timer(func):
+    def wrapper(*args, **kwargs):
+        start_time  = time.time()
+        result      = func(*args, **kwargs)
+        end_time    = time.time()
+        print(f"function {func.__name__} running for {end_time - start_time} seconds")
+        return result
+
 class NeptuneLogger:
     def __init__(self, folder_name):
         self.folder_name = folder_name
@@ -300,3 +310,4 @@ class NeptuneLogger:
         # else:
         with self.lock:
             self.buffered_logs.append((key, value))
+

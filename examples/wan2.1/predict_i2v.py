@@ -31,8 +31,11 @@ from videox_fun.utils.utils import (filter_kwargs, get_image_to_video_latent,
 from videox_fun.utils.fm_solvers import FlowDPMSolverMultistepScheduler
 from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
-# GPU memory mode, which can be choosen in [model_full_load, model_cpu_offload, model_cpu_offload_and_qfloat8, sequential_cpu_offload].
+# GPU memory mode, which can be choosen in [model_full_load, model_full_load_and_qfloat8, model_cpu_offload, model_cpu_offload_and_qfloat8, sequential_cpu_offload].
 # model_full_load means that the entire model will be moved to the GPU.
+# 
+# model_full_load_and_qfloat8 means that the entire model will be moved to the GPU,
+# and the transformer model has been quantized to float8, which can save more GPU memory. 
 # 
 # model_cpu_offload means that the entire model will be moved to the CPU after use, which can save some GPU memory.
 # 
@@ -47,7 +50,11 @@ GPU_memory_mode     = "no_cpu_offload"
 # Please ensure that the product of ulysses_degree and ring_degree equals the number of GPUs used. 
 # For example, if you are using 8 GPUs, you can set ulysses_degree = 2 and ring_degree = 4.
 # If you are using 1 GPU, you can set ulysses_degree = 1 and ring_degree = 1.
+
 fsdp_dit            = False
+# Compile will give a speedup in fixed resolution and need a little GPU memory. 
+# The compile_dit is not compatible with the fsdp_dit.
+compile_dit         = False
 
 # Skip some cfg steps in inference
 # Recommended to be set between 0.00 and 0.25
@@ -63,7 +70,7 @@ config_path         = "config/wan2.1/wan_civitai.yaml"
 # model path
 
 # Choose the sampler in "Flow", "Flow_Unipc", "Flow_DPM++"
-sampler_name        = "Flow"
+sampler_name        = "Flow_Unipc"
 # [NOTE]: Noise schedule shift parameter. Affects temporal dynamics. 
 # Used when the sampler is in "Flow_Unipc", "Flow_DPM++".
 # If you want to generate a 480p video, it is recommended to set the shift value to 3.0.
@@ -142,6 +149,7 @@ if __name__ == "__main__":
         if dist.get_rank() == 0:
             is_main_process = True
     else:
+
         is_main_process = True
     if not os.path.exists(args.save_dir_path) and is_main_process:
         os.makedirs(args.save_dir_path, exist_ok=True)

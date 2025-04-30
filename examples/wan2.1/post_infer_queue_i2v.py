@@ -24,15 +24,23 @@ def post_infer(
     height_slider=384,
     cfg_scale_slider=6,
     seed_textbox=43,
+    enable_teacache = None, 
+    teacache_threshold = None, 
+    num_skip_start_steps = None, 
+    teacache_offload = None, 
+    cfg_skip_ratio = None,
+    enable_riflex = None, 
+    riflex_k = None, 
     start_image=None 
 ):
     if start_image:
         try:
-            image = Image.open(start_image)
-            # 将图片转换为 Base64 编码
-            buffered = BytesIO()
-            image.save(buffered, format=image.format)
-            start_image = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            if not start_image.startswith("http"):
+                image = Image.open(start_image).convert("RGB")
+                # 将图片转换为 Base64 编码
+                buffered = BytesIO()
+                image.save(buffered, format="JPEG")
+                start_image = base64.b64encode(buffered.getvalue()).decode('utf-8')
         except Exception as e:
             print(f"Error processing start_image: {e}")
             raise
@@ -52,6 +60,14 @@ def post_infer(
         "length_slider": length_slider,
         "cfg_scale_slider": cfg_scale_slider,
         "seed_textbox": seed_textbox,
+        
+        "enable_teacache": enable_teacache,
+        "teacache_threshold": teacache_threshold,
+        "num_skip_start_steps": num_skip_start_steps,
+        "teacache_offload": teacache_offload,
+        "cfg_skip_ratio": cfg_skip_ratio,
+        "enable_riflex": enable_riflex,
+        "riflex_k": riflex_k,
         "start_image": start_image
     })
 
@@ -60,6 +76,8 @@ def post_infer(
     session.headers.update({"Authorization": POST_TOKEN})
 
     # Send POST request
+    if url[-1] == "/":
+        url = url[:-1]
     post_r = session.post(f'{url}/videox_fun/infer_forward', data=datas, timeout=timeout)
 
     # Extract request ID from POST response headers
@@ -90,7 +108,6 @@ def post_infer(
     data = get_r.content.decode('utf-8')
     return data
 
-
 if __name__ == '__main__':
     # initiate time
     time_start = time.time()  
@@ -100,6 +117,26 @@ if __name__ == '__main__':
     # Use in EAS Queue
     TOKEN   = 'xxxxxxxx'
         
+    # Support TeaCache.
+    enable_teacache     = True
+    # Recommended to be set between 0.05 and 0.20. A larger threshold can cache more steps, speeding up the inference process, 
+    # but it may cause slight differences between the generated content and the original content.
+    teacache_threshold  = 0.10
+    # The number of steps to skip TeaCache at the beginning of the inference process, which can
+    # reduce the impact of TeaCache on generated video quality.
+    num_skip_start_steps = 5
+    # Whether to offload TeaCache tensors to cpu to save a little bit of GPU memory.
+    teacache_offload    = False
+
+    # Skip some cfg steps in inference
+    # Recommended to be set between 0.00 and 0.25
+    cfg_skip_ratio      = 0
+
+    # Riflex config
+    enable_riflex       = False
+    # Index of intrinsic frequency
+    riflex_k            = 6
+
     # "Video Generation" and "Image Generation"
     generation_method = "Video Generation"
     # Video length
@@ -111,7 +148,7 @@ if __name__ == '__main__':
     prompt_textbox = "一只棕色的狗摇着头，坐在舒适房间里的浅色沙发上。在狗的后面，架子上有一幅镶框的画，周围是粉红色的花朵。房间里柔和温暖的灯光营造出舒适的氛围。"
     negative_prompt_textbox = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
     # Sampler name
-    sampler_dropdown = "Flow"
+    sampler_dropdown = "Flow_Unipc"
     # Sampler steps
     sample_step_slider = 50
     # height and width 
@@ -137,6 +174,13 @@ if __name__ == '__main__':
         height_slider=height_slider,
         cfg_scale_slider=cfg_scale_slider,
         seed_textbox=seed_textbox,
+        enable_teacache = enable_teacache, 
+        teacache_threshold = teacache_threshold, 
+        num_skip_start_steps = num_skip_start_steps, 
+        teacache_offload = teacache_offload,
+        cfg_skip_ratio = cfg_skip_ratio, 
+        enable_riflex = enable_riflex, 
+        riflex_k = riflex_k, 
         url=EAS_URL, 
         POST_TOKEN=TOKEN,
         start_image=start_image_path  # 传递起始图片路径
