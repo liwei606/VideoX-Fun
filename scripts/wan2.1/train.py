@@ -77,7 +77,7 @@ from videox_fun.models import (AutoencoderKLWan, CLIPModel, WanT5EncoderModel,
                               WanTransformer3DModel)
 from videox_fun.pipeline import WanPipeline, WanI2VPipeline
 from videox_fun.utils.discrete_sampler import DiscreteSampling
-from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid
+from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid, NeptuneLogger
 
 if is_wandb_available():
     import wandb
@@ -207,13 +207,26 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                     with torch.autocast("cuda", dtype=weight_dtype):
                         video_length = int((args.video_sample_n_frames - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1 if args.video_sample_n_frames != 1 else 1
                         basename = os.path.basename(args.validation_image_starts[i])[:-4]
-                        input_video, input_video_mask, clip_image = get_image_to_video_latent(args.validation_image_starts[i], None, video_length=video_length, sample_size=[args.valid_video_height, args.valid_video_width])
+                        
+                        image_check = Image.open(args.validation_image_starts[i]).convert("RGB")
+                        img_check_width, img_check_height = image_check.size
+                        aspect_ratio_sample_size = {key : [x / 512 * args.video_sample_size for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
+                        closest_size, closest_ratio = get_closest_ratio(img_check_height, img_check_width, ratios=aspect_ratio_sample_size)
+                        closest_size = [int(x / 16) * 16 for x in closest_size]
+                        closest_size = list(map(lambda x: int(x), closest_size))
+                        if closest_size[0] / img_check_height > closest_size[1] / img_check_width:
+                            resize_size = closest_size[0], int(img_check_width * closest_size[0] / img_check_height)
+                        else:
+                            resize_size = int(img_check_height * closest_size[1] / img_check_width), closest_size[1]
+                        valid_video_height, valid_video_width = closest_size
+                        input_video, input_video_mask, clip_image = get_image_to_video_latent(args.validation_image_starts[i], None, video_length=video_length, sample_size=resize_size, center_crop_size=closest_size)
+
                         sample = pipeline(
                             args.validation_prompts[i],
                             num_frames = video_length,
                             negative_prompt = args.validation_neg_prompts[i],
-                            height      = args.valid_video_height,
-                            width       = args.valid_video_width,
+                            height      = valid_video_height,
+                            width       = valid_video_width,
                             guidance_scale = 6.0,
                             generator   = generator,
 
@@ -225,13 +238,13 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                         save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-{i}-{basename}.mp4"))
 
                         video_length = 1
-                        input_video, input_video_mask, _ = get_image_to_video_latent(args.validation_image_starts[i], None, video_length=video_length, sample_size=[args.valid_video_height, args.valid_video_width])
+                        input_video, input_video_mask, clip_image = get_image_to_video_latent(args.validation_image_starts[i], None, video_length=video_length, sample_size=resize_size, center_crop_size=closest_size)
                         sample = pipeline(
                             args.validation_prompts[i],
                             num_frames = video_length,
                             negative_prompt = args.validation_neg_prompts[i],
-                            height      = args.valid_video_height,
-                            width       = args.valid_video_width,
+                            height      = valid_video_height,
+                            width       = valid_video_width,
                             guidance_scale = 6.0,
                             generator   = generator, 
 
@@ -249,8 +262,8 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                             args.validation_prompts[i],
                             num_frames = args.video_sample_n_frames,
                             negative_prompt = args.validation_neg_prompts[i],
-                            height      = args.valid_video_height,
-                            width       = args.valid_video_width,
+                            height      = valid_video_height,
+                            width       = valid_video_width,
                             generator   = generator
                         ).videos
                         os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
@@ -260,8 +273,8 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                             args.validation_prompts[i], 
                             num_frames = args.video_sample_n_frames,
                             negative_prompt = args.validation_neg_prompts[i],
-                            height      = args.valid_video_height,
-                            width       = args.valid_video_width,
+                            height      = valid_video_height,
+                            width       = valid_video_width,
                             generator   = generator
                         ).videos
                         os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
@@ -303,8 +316,7 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
-        required=True,
+        default="models/SkyReels-V2-I2V-1.3B-540P",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -378,7 +390,7 @@ def parse_args():
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
     parser.add_argument(
         "--random_flip",
         action="store_true",
@@ -395,12 +407,12 @@ def parse_args():
         help="whether to use cuda multi-stream",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--vae_mini_batch", type=int, default=32, help="mini batch size for vae."
+        "--vae_mini_batch", type=int, default=2, help="mini batch size for vae."
     )
-    parser.add_argument("--num_train_epochs", type=int, default=100)
+    parser.add_argument("--num_train_epochs", type=int, default=1000)
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -421,7 +433,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-4,
+        default=2e-05,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -433,14 +445,14 @@ def parse_args():
     parser.add_argument(
         "--lr_scheduler",
         type=str,
-        default="constant",
+        default="constant_with_warmup",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
             ' "constant", "constant_with_warmup"]'
         ),
     )
     parser.add_argument(
-        "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
+        "--lr_warmup_steps", type=int, default=100, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument(
         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
@@ -467,16 +479,16 @@ def parse_args():
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=0,
+        default=8,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
     )
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
-    parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
+    parser.add_argument("--adam_weight_decay", type=float, default=3e-2, help="Weight decay to use.")
+    parser.add_argument("--adam_epsilon", type=float, default=1e-10, help="Epsilon value for the Adam optimizer")
+    parser.add_argument("--max_grad_norm", default=0.05, type=float, help="Max gradient norm.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
     parser.add_argument(
@@ -506,7 +518,7 @@ def parse_args():
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default=None,
+        default="bf16",
         choices=["no", "fp16", "bf16"],
         help=(
             "Whether to use mixed precision. Choose between fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -527,7 +539,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=1000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -558,7 +570,7 @@ def parse_args():
     parser.add_argument(
         "--validation_steps",
         type=int,
-        default=2000,
+        default=1000,
         help="Run validation every X steps.",
     )
     parser.add_argument(
@@ -624,25 +636,13 @@ def parse_args():
     parser.add_argument(
         "--video_sample_size",
         type=int,
-        default=512,
+        default=720,
         help="Sample size of the video.",
     )
     parser.add_argument(
         "--image_sample_size",
         type=int,
-        default=512,
-        help="Sample size of the video.",
-    )
-    parser.add_argument(
-        "--valid_video_height",
-        type=int,
-        default=512,
-        help="Sample size of the video.",
-    )
-    parser.add_argument(
-        "--valid_video_width",
-        type=int,
-        default=512,
+        default=1024,
         help="Sample size of the video.",
     )
     parser.add_argument(
@@ -654,13 +654,13 @@ def parse_args():
     parser.add_argument(
         "--video_sample_n_frames",
         type=int,
-        default=17,
+        default=81,
         help="Num frame of video.",
     )
     parser.add_argument(
         "--video_repeat",
         type=int,
-        default=0,
+        default=1,
         help="Num of repeat video.",
     )
     parser.add_argument(
@@ -710,7 +710,7 @@ def parse_args():
     parser.add_argument(
         "--train_mode",
         type=str,
-        default="normal",
+        default="i2v",
         help=(
             'The format of training data. Support `"normal"`'
             ' (default), `"i2v"`.'
@@ -765,6 +765,39 @@ def parse_args():
 
 
 def main():
+    # CUDA_VISIBLE_DEVICES=0,1,2,3 /home/weili/miniconda3/envs/wan21_xc/bin/accelerate \
+    #     launch --num_processes 4 \
+    #     scripts/wan2.1/train.py \
+    #     --config_path config/wan2.1/sky_i2v_1.3B.yaml \
+    #     --enable_bucket \
+    #     --uniform_sampling \
+    #     --trainable_modules "." \
+    #     --preprocess_text_embed asset/xc_half_body_talkEasyPrompt.pt \
+    #     --train_batch_size 2 
+    #     --output_dir output_dir/xxx \
+    #     --gradient_checkpointing
+    #     Bellow is default --------------------------------------------------------
+    #     --train_mode default i2v \
+    #     --pretrained_model_name_or_path default models/SkyReels-V2-I2V-1.3B-540P \
+    #     --image_sample_size default 1024 \
+    #     --video_sample_size default 720 \
+    #     --video_sample_n_frames default 81 \
+    #     --train_batch_size default 1 \
+    #     --video_repeat default 1 \
+    #     --gradient_accumulation_steps default 1 \
+    #     --dataloader_num_workers default 8 \
+    #     --num_train_epochs default 1000 \
+    #     --checkpointing_steps default 1000 \
+    #     --validation_steps default 1000 \
+    #     --learning_rate default 2e-05 \
+    #     --lr_scheduler default constant_with_warmup or select constant \
+    #     --lr_warmup_steps default 100 \
+    #     --seed default 42 \
+    #     --mixed_precision default bf16 \
+    #     --adam_weight_decay default 3e-2 \
+    #     --adam_epsilon default 1e-10 \
+    #     --vae_mini_batch default 2 \
+    #     --max_grad_norm default 0.05
     args = parse_args()
 
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -811,6 +844,8 @@ def main():
         print("DeepSpeed is not enabled.")
     if accelerator.is_main_process:
         writer = SummaryWriter(log_dir=logging_dir)
+        neptune_run = NeptuneLogger(folder_name=os.path.basename(args.output_dir))
+        
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -1236,7 +1271,9 @@ def main():
                 # To 0~1
                 pixel_values = torch.from_numpy(example["pixel_values"]).permute(0, 3, 1, 2).contiguous()
                 pixel_values = pixel_values / 255.
-                union_mouth_masks = torch.from_numpy(example["union_mouth_masks"]).permute(0, 3, 1, 2).contiguous()
+                union_mouth_masks = (torch.from_numpy(example["union_mouth_masks"])[None, ...]
+                    .repeat(pixel_values.size(0), 1, 1, 1)
+                    .permute(0, 3, 1, 2).contiguous())
                 union_mouth_masks = union_mouth_masks / 255.
                 if args.random_ratio_crop:
                     # Get adapt hw for resize
@@ -1271,10 +1308,10 @@ def main():
                     transform_mask = transforms.Compose([
                         transforms.Resize(resize_size, interpolation=transforms.InterpolationMode.NEAREST),  # Image.NEAREST
                         transforms.CenterCrop(closest_size),
-                        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+                        # transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
                     ])
                 new_examples["pixel_values"].append(transform(pixel_values))
-                new_examples["union_mouth_masks"].append(transform(union_mouth_masks))
+                new_examples["union_mouth_masks"].append(transform_mask(union_mouth_masks))
                 new_examples["text"].append(example["text"])
 
                 batch_video_length = int(min(batch_video_length, len(pixel_values)))
@@ -1787,11 +1824,14 @@ def main():
                             for name, param in transformer3d.named_parameters():
                                 if param.requires_grad:
                                     writer.add_scalar(f'gradients/before_clip_norm/{name}', param.grad.norm(), global_step=global_step)
+                                    neptune_run.log(f"gradients/before_clip_norm/{name}", param.grad.norm())
 
                     norm_sum = accelerator.clip_grad_norm_(trainable_params, actual_max_grad_norm)
                     if not args.use_deepspeed and args.report_model_info and accelerator.is_main_process:
                         writer.add_scalar(f'gradients/norm_sum', norm_sum, global_step=global_step)
                         writer.add_scalar(f'gradients/actual_max_grad_norm', actual_max_grad_norm, global_step=global_step)
+                        neptune_run.log("gradients/norm_sum", norm_sum)
+                        neptune_run.log("gradients/actual_max_grad_norm", actual_max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -1804,6 +1844,7 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
+                if accelerator.is_main_process: neptune_run.log("train_loss", train_loss)
                 train_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:

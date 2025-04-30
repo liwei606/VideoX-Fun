@@ -29,6 +29,7 @@ from .wan_camera_adapter import SimpleAdapter
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
+    print("Using Flash Attention 3 !!!")
 except ModuleNotFoundError:
     FLASH_ATTN_3_AVAILABLE = False
 
@@ -107,7 +108,6 @@ def flash_attention(
         warnings.warn(
             'Flash attention 3 is not available, use flash attention 2 instead.'
         )
-
     # apply attention
     if (version is None or version == 3) and FLASH_ATTN_3_AVAILABLE:
         # Note: dropout_p, window_size are not supported in FA3 now.

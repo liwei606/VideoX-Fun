@@ -6,6 +6,10 @@ from ..dist import (get_sequence_parallel_rank,
                     init_distributed_environment, initialize_model_parallel,
                     xFuserLongContextAttention)
 
+try:
+    from yunchang.kernels import FlashAttentionImpl
+except ImportError:
+    raise ImportError("Please install yunchang 0.4.1 or later")
 
 def pad_freqs(original_tensor, target_len):
     seq_len, s1, s2 = original_tensor.shape

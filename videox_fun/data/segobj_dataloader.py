@@ -80,13 +80,55 @@ def convert_cuts_format(vid_meta):
         convert_list.append((folder, name, split_origin_dict[ori_name]))
     return convert_list
 
+def compute_iou(box1, box2):
+    # 解包坐标
+    x0, y0, x1, y1 = box1
+    x0_enum, y0_enum, x1_enum, y1_enum = box2
+
+    xi0 = max(x0, x0_enum)
+    yi0 = max(y0, y0_enum)
+    xi1 = min(x1, x1_enum)
+    yi1 = min(y1, y1_enum)
+
+    inter_width = max(0, xi1 - xi0)
+    inter_height = max(0, yi1 - yi0)
+    inter_area = inter_width * inter_height
+
+    area1 = max(0, x1 - x0) * max(0, y1 - y0)
+    area2 = max(0, x1_enum - x0_enum) * max(0, y1_enum - y0_enum)
+
+    union_area = area1 + area2 - inter_area
+
+    if union_area == 0:
+        return 0.0
+
+    # 计算 IoU
+    iou = inter_area / union_area
+    return iou
+
+def get_from_obj_set(obj_set_dict, self_boxes, iou_thresh):
+    x0, y0, x1, y1, conf, cls_id = self_boxes
+    in_obj = -1
+    for enum_obj, enum_boxes in obj_set_dict.items():
+        x0_enum, y0_enum, x1_enum, y1_enum, conf_enum, cls_id_enum = enum_boxes
+        iou = compute_iou((x0, y0, x1, y1), (x0_enum, y0_enum, x1_enum, y1_enum))
+        if cls_id_enum == cls_id and iou >= iou_thresh:
+            in_obj = enum_obj
+    if in_obj == -1:
+        in_obj = len(obj_set_dict)
+        obj_set_dict[in_obj] = self_boxes
+    return in_obj, obj_set_dict
+
 def dfs_object_random(frame_idxs, 
                       match_object_dict, 
                       cur_cut_name,
                       skip_self, 
                       score_down, 
-                      score_up):
+                      score_up,
+                      objs_boxes=None,
+                      obj_iou_thresh=None):
     obj_avaible_dict = {}
+    obj_set_dict = {}
     for cut_name, cut_dict in match_object_dict.items():
         if cur_cut_name == cut_name and skip_self: continue
         for frame_idx in frame_idxs:
@@ -94,12 +136,17 @@ def dfs_object_random(frame_idxs,
             frame_dict = cut_dict[frame_idx]
             for other_frame_idx, other_frame_dict in frame_dict.items():
                 for obj_idx, obj_dict in other_frame_dict.items():
+                    if objs_boxes is not None:
+                        self_boxes = objs_boxes[frame_idx][obj_idx]
+                        self_obj_idx, obj_set_dict = get_from_obj_set(obj_set_dict, self_boxes, obj_iou_thresh)
+                    else:
+                        self_obj_idx = obj_idx
                     for other_obj_idx, match_score in obj_dict.items():
                         if match_score >= score_down and match_score <= score_up:
-                            obj_avaible_dict[obj_idx] = [] if obj_idx not in obj_avaible_dict else obj_avaible_dict[obj_idx]
-                            obj_avaible_dict[obj_idx].append((cut_name, other_frame_idx, other_obj_idx))
-    for obj_idx in obj_avaible_dict:
-        obj_avaible_dict[obj_idx] = random.choice(obj_avaible_dict[obj_idx])
+                            obj_avaible_dict[self_obj_idx] = [] if self_obj_idx not in obj_avaible_dict else obj_avaible_dict[self_obj_idx]
+                            obj_avaible_dict[self_obj_idx].append((cut_name, other_frame_idx, other_obj_idx))
+    for self_obj_idx in obj_avaible_dict:
+        obj_avaible_dict[self_obj_idx] = random.choice(obj_avaible_dict[self_obj_idx])
     return obj_avaible_dict
 
 class LiveVideoDataset(Dataset):
@@ -124,6 +171,7 @@ class LiveVideoDataset(Dataset):
         self.clip_object_sim_up = self.cfg.data.get("clip_object_sim_up", 0.95)
         self.clip_object_sim_down = self.cfg.data.get("clip_object_sim_down", 0.75)
         self.arc_face_sim_down = self.cfg.data.get("arc_face_sim_down", 0.75)
+        self.obj_iou_thresh = self.cfg.data.get("obj_iou_thresh", 0.75)
 
         if split == 'train': 
             dataset_file_path_list = cfg.data.dataset_file_path
@@ -303,19 +351,24 @@ class LiveVideoDataset(Dataset):
         
         match_object_dict = video_metadata["match_object_dict"]
         match_face_dict = video_metadata["match_face_dict"]
+        objs_boxes = video_metadata["objs_boxes"]
         
         obj_select_dict = dfs_object_random(target_frame_indices_new[tgt_batch_index], 
                                             match_object_dict,
                                             cur_cut_name,
                                             True,
                                             self.clip_object_sim_down,
-                                            self.clip_object_sim_up)
+                                            self.clip_object_sim_up,
+                                            objs_boxes,
+                                            self.obj_iou_thresh)
         face_select_dict = dfs_object_random(target_frame_indices_new[tgt_batch_index], 
                                             match_face_dict,
                                             cur_cut_name,
                                             True,
                                             self.arc_face_sim_down,
-                                            1)
+                                            1,
+                                            None,
+                                            None)
         object_refers = []
         for obj_select_key, obj_select_value in obj_select_dict.items():
             cut_name, other_frame_idx, other_obj_idx = obj_select_value
@@ -389,7 +442,7 @@ class LiveVideoDataset(Dataset):
         if len(face_refers) == 0:
             face_refers = [np.zeros_like(vid_pil_image_list[0])]
         else:
-            object_refers = [np.array(Image.fromarray(x).resize((wd, hd))) for x in object_refers]
+            face_refers = [np.array(Image.fromarray(x).resize((wd, hd))) for x in face_refers]
         sample = dict(
             video_path = video_path,
             pixel_values = pixel_values,

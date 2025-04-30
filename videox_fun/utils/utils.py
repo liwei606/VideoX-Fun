@@ -6,8 +6,14 @@ import numpy as np
 import torch
 import torchvision
 import cv2
+import asyncio
+import neptune
+import threading
+
+from time import time, sleep
 from einops import rearrange
 from PIL import Image
+from torchvision import transforms
 
 def filter_kwargs(cls, kwargs):
     sig = inspect.signature(cls.__init__)
@@ -51,7 +57,7 @@ def color_transfer(sc, dc):
     dst = cv2.cvtColor(cv2.convertScaleAbs(img_n), cv2.COLOR_LAB2RGB)
     return dst
 
-def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=6, fps=12, imageio_backend=True, color_transfer_post_process=False):
+def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=6, fps=25, imageio_backend=True, color_transfer_post_process=False):
     videos = rearrange(videos, "b c t h w -> t b c h w")
     outputs = []
     for x in videos:
@@ -67,17 +73,18 @@ def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=6, f
             outputs[i] = Image.fromarray(color_transfer(np.uint8(outputs[i]), np.uint8(outputs[0])))
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    if imageio_backend:
-        if path.endswith("mp4"):
-            imageio.mimsave(path, outputs, fps=fps)
-        else:
-            imageio.mimsave(path, outputs, duration=(1000 * 1/fps))
-    else:
-        if path.endswith("mp4"):
-            path = path.replace('.mp4', '.gif')
-        outputs[0].save(path, format='GIF', append_images=outputs, save_all=True, duration=100, loop=0)
+    imageio.mimwrite(path, outputs, fps=fps)
+    # if imageio_backend:
+    #     if path.endswith("mp4"):
+    #         imageio.mimsave(path, outputs, fps=fps)
+    #     else:
+    #         imageio.mimsave(path, outputs, duration=(1000 * 1/fps))
+    # else:
+    #     if path.endswith("mp4"):
+    #         path = path.replace('.mp4', '.gif')
+    #     outputs[0].save(path, format='GIF', append_images=outputs, save_all=True, duration=100, loop=0)
 
-def get_image_to_video_latent(validation_image_start, validation_image_end, video_length, sample_size):
+def get_image_to_video_latent(validation_image_start, validation_image_end, video_length, sample_size, center_crop_size=None):
     if validation_image_start is not None and validation_image_end is not None:
         if type(validation_image_start) is str and os.path.isfile(validation_image_start):
             image_start = clip_image = Image.open(validation_image_start).convert("RGB")
@@ -140,6 +147,10 @@ def get_image_to_video_latent(validation_image_start, validation_image_end, vide
             image_start = [_image_start.resize([sample_size[1], sample_size[0]]) for _image_start in image_start]
             clip_image = [_clip_image.resize([sample_size[1], sample_size[0]]) for _clip_image in clip_image]
         image_end = None
+        if center_crop_size is not None:
+            center_crop_transform = transforms.CenterCrop([int(x) for x in center_crop_size])
+            image_start = center_crop_transform(image_start)
+            clip_image = center_crop_transform(clip_image)
         
         if type(image_start) is list:
             clip_image = clip_image[0]
@@ -246,3 +257,46 @@ def get_image_latent(ref_image=None, sample_size=None):
             ref_image = ref_image.unsqueeze(0).permute([3, 0, 1, 2]).unsqueeze(0) / 255
 
     return ref_image
+
+class NeptuneLogger:
+    def __init__(self, folder_name):
+        self.folder_name = folder_name
+        self.neptune_run = None
+        self.buffered_logs = []
+        self.lock = threading.Lock()
+        self.is_initialized = False
+        self.init_task = threading.Thread(target=self._init_neptune_async)
+        self.init_task.start()
+
+    
+    def _init_neptune_async(self):
+        while True:
+            try:
+                self.neptune_run = neptune.init_run(
+                    project="real-time-video-gen/vqae",
+                    api_token="eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiIwN2ZhODIzOC02ZmYwLTQ3ZmYtODQ0OC01ODE1ZjQxNDI0YTQifQ==",
+                    name=self.folder_name,
+                    mode="async",
+                )
+                break
+            except Exception as e:
+                import traceback;traceback.print_exc()
+        self.is_initialized = True
+        # Flush buffered logs
+        while True:
+            sleep(30)
+            if len(self.buffered_logs) == 0:
+                continue
+            with self.lock:
+                for k, v in self.buffered_logs:
+                    self.neptune_run[k].append(v)
+                self.buffered_logs = []  # 清空缓存
+            
+            
+            
+    def log(self, key, value):
+        # if self.is_initialized:
+        #     self.neptune_run[key].append(value)
+        # else:
+        with self.lock:
+            self.buffered_logs.append((key, value))
