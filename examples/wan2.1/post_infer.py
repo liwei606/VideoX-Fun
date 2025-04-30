@@ -61,10 +61,12 @@ def post_infer(
 
     # Initialize session and set headers
     session = requests.session()
+    if url[-1] == "/":
+        url = url[:-1]
     session.headers.update({"Authorization": POST_TOKEN})
 
     # Send POST request
-    post_r = session.post(f'{url}/cogvideox_fun/infer_forward', data=datas, timeout=timeout)
+    post_r = session.post(f'{url}/videox_fun/infer_forward', data=datas, timeout=timeout)
     
     data = post_r.content.decode('utf-8')
     return data
@@ -99,7 +101,7 @@ if __name__ == '__main__':
     prompt_textbox      = "A young woman with beautiful and clear eyes and blonde hair standing and white dress in a forest wearing a crown. She seems to be lost in thought, and the camera focuses on her face. The video is of high quality, and the view is very clear. High quality, masterpiece, best quality, highres, ultra-detailed, fantastic."
     negative_prompt_textbox = "The video is not of a high quality, it has a low resolution. Watermark present in each frame. The background is solid. Strange body and strange trajectory. Distortion."
     # Sampler name
-    sampler_dropdown    = "Flow"
+    sampler_dropdown    = "Flow_Unipc"
     # Sampler steps
     sample_step_slider  = 50
     # height and width 

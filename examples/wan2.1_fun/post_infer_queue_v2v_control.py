@@ -2,7 +2,11 @@ import base64
 import json
 import time
 import urllib.parse
+from io import BytesIO
+
 import requests
+from PIL import Image
+
 
 def post_infer(
     generation_method, 
@@ -21,7 +25,15 @@ def post_infer(
     height_slider=384,
     cfg_scale_slider=6,
     seed_textbox=43,
-    control_video=None
+    enable_teacache = None, 
+    teacache_threshold = None, 
+    num_skip_start_steps = None, 
+    teacache_offload = None, 
+    cfg_skip_ratio = None,
+    enable_riflex = None, 
+    riflex_k = None, 
+    control_video = None,
+    ref_image = None
 ):
     if control_video:
         try:
@@ -32,6 +44,18 @@ def post_infer(
                 control_video = base64.b64encode(video_data).decode('utf-8')
         except Exception as e:
             print(f"Error processing control_video: {e}")
+            raise
+
+    if ref_image:
+        try:
+            if not ref_image.startswith("http"):
+                image = Image.open(ref_image).convert("RGB")
+                # 将图片转换为 Base64 编码
+                buffered = BytesIO()
+                image.save(buffered, format="JPEG")
+                ref_image = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        except Exception as e:
+            print(f"Error processing ref_image: {e}")
             raise
 
     # Prepare the data payload
@@ -49,6 +73,15 @@ def post_infer(
         "length_slider": length_slider,
         "cfg_scale_slider": cfg_scale_slider,
         "seed_textbox": seed_textbox,
+
+        "ref_image": ref_image,
+        "enable_teacache": enable_teacache,
+        "teacache_threshold": teacache_threshold,
+        "num_skip_start_steps": num_skip_start_steps,
+        "teacache_offload": teacache_offload,
+        "cfg_skip_ratio": cfg_skip_ratio,
+        "enable_riflex": enable_riflex,
+        "riflex_k": riflex_k,
         "control_video": control_video
     })
 
@@ -57,6 +90,8 @@ def post_infer(
     session.headers.update({"Authorization": POST_TOKEN})
 
     # Send POST request
+    if url[-1] == "/":
+        url = url[:-1]
     post_r = session.post(f'{url}/videox_fun/infer_forward', data=datas, timeout=timeout)
 
     # Extract request ID from POST response headers
@@ -97,6 +132,26 @@ if __name__ == '__main__':
     # Use in EAS Queue
     TOKEN   = 'xxxxxxxx'
         
+    # Support TeaCache.
+    enable_teacache     = True
+    # Recommended to be set between 0.05 and 0.20. A larger threshold can cache more steps, speeding up the inference process, 
+    # but it may cause slight differences between the generated content and the original content.
+    teacache_threshold  = 0.10
+    # The number of steps to skip TeaCache at the beginning of the inference process, which can
+    # reduce the impact of TeaCache on generated video quality.
+    num_skip_start_steps = 5
+    # Whether to offload TeaCache tensors to cpu to save a little bit of GPU memory.
+    teacache_offload    = False
+
+    # Skip some cfg steps in inference
+    # Recommended to be set between 0.00 and 0.25
+    cfg_skip_ratio      = 0
+
+    # Riflex config
+    enable_riflex       = False
+    # Index of intrinsic frequency
+    riflex_k            = 6
+        
     # "Video Generation" and "Image Generation"
     generation_method = "Video Generation"
     # Video length
@@ -120,6 +175,8 @@ if __name__ == '__main__':
 
     # 控制视频路径（可以是本地路径或 URL）
     control_video_path = "asset/000000.mp4"  # 替换为实际的视频路径
+    # 参考图片路径
+    ref_image_path = None  # 替换为实际的图片路径
 
     outputs = post_infer(
         generation_method, 
@@ -134,9 +191,17 @@ if __name__ == '__main__':
         height_slider=height_slider,
         cfg_scale_slider=cfg_scale_slider,
         seed_textbox=seed_textbox,
+        enable_teacache = enable_teacache, 
+        teacache_threshold = teacache_threshold, 
+        num_skip_start_steps = num_skip_start_steps, 
+        teacache_offload = teacache_offload,
+        cfg_skip_ratio = cfg_skip_ratio, 
+        enable_riflex = enable_riflex, 
+        riflex_k = riflex_k, 
         url=EAS_URL, 
         POST_TOKEN=TOKEN,
-        control_video=control_video_path  # 传递控制视频路径
+        control_video=control_video_path,  # 传递控制视频路径
+        ref_image=ref_image_path  # 传递参考图片路径
     )
     # Get decoded data
     outputs = json.loads(base64.b64decode(json.loads(outputs)[0]['data']))
