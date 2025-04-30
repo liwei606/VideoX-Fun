@@ -1,16 +1,20 @@
 # This file is modified from https://github.com/xdit-project/xDiT/blob/main/entrypoints/launch.py
 import base64
 import gc
+import hashlib
+import io
 import os
+import tempfile
 from io import BytesIO
 
 import gradio as gr
+import requests
 import torch
+import torch.distributed as dist
 from fastapi import FastAPI, HTTPException
 from PIL import Image
 
-from .api import (encode_file_to_base64, save_base64_image, save_base64_video,
-                  save_url_image, save_url_video)
+from .api import download_from_url, encode_file_to_base64
 
 try:
     import ray
@@ -18,15 +22,63 @@ except:
     print("Ray is not installed. If you want to use multi gpus api. Please install it by running 'pip install ray'.")
     ray =  None
 
+def save_base64_video_dist(base64_string):
+    video_data = base64.b64decode(base64_string)
+
+    md5_hash = hashlib.md5(video_data).hexdigest()
+    filename = f"{md5_hash}.mp4"  
+    
+    temp_dir = tempfile.gettempdir()
+    file_path = os.path.join(temp_dir, filename)
+
+    if dist.is_initialized():
+        if dist.get_rank() == 0:
+            with open(file_path, 'wb') as video_file:
+                video_file.write(video_data)
+        dist.barrier()
+    else:
+        with open(file_path, 'wb') as video_file:
+            video_file.write(video_data)
+    return file_path
+
+def save_base64_image_dist(base64_string):
+    video_data = base64.b64decode(base64_string)
+
+    md5_hash = hashlib.md5(video_data).hexdigest()
+    filename = f"{md5_hash}.jpg"  
+    
+    temp_dir = tempfile.gettempdir()
+    file_path = os.path.join(temp_dir, filename)
+
+    if dist.is_initialized():
+        if dist.get_rank() == 0:
+            with open(file_path, 'wb') as video_file:
+                video_file.write(video_data)
+        dist.barrier()
+    else:
+        with open(file_path, 'wb') as video_file:
+            video_file.write(video_data)
+    return file_path
+
+def save_url_video_dist(url):
+    video_data = download_from_url(url)
+    if video_data:
+        return save_base64_video_dist(base64.b64encode(video_data))
+    return None
+
+def save_url_image_dist(url):
+    image_data = download_from_url(url)
+    if image_data:
+        return save_base64_image_dist(base64.b64encode(image_data))
+    return None
+
 if ray is not None:
     @ray.remote(num_gpus=1)
     class MultiNodesGenerator:
         def __init__(
             self, rank: int, world_size: int, Controller,
             GPU_memory_mode, scheduler_dict, model_name=None, model_type="Inpaint", 
-            config_path=None, ulysses_degree=1, ring_degree=1,
-            enable_teacache=None, teacache_threshold=None, 
-            num_skip_start_steps=None, teacache_offload=None, weight_dtype=None, 
+            config_path=None, ulysses_degree=1, ring_degree=1, weight_dtype=None, 
             savedir_sample=None,
         ):
             # Set PyTorch distributed environment variables
@@ -38,8 +90,7 @@ if ray is not None:
             self.rank = rank
             self.controller = Controller(
                 GPU_memory_mode, scheduler_dict, model_name=model_name, model_type=model_type, config_path=config_path, 
-                ulysses_degree=ulysses_degree, ring_degree=ring_degree, enable_teacache=enable_teacache, teacache_threshold=teacache_threshold, num_skip_start_steps=num_skip_start_steps, 
-                teacache_offload=teacache_offload, weight_dtype=weight_dtype, savedir_sample=savedir_sample,
+                ulysses_degree=ulysses_degree, ring_degree=ring_degree, weight_dtype=weight_dtype, savedir_sample=savedir_sample,
             )
 
         def generate(self, datas):
@@ -68,43 +119,60 @@ if ray is not None:
                 control_video = datas.get('control_video', None)
                 denoise_strength = datas.get('denoise_strength', 0.70)
                 seed_textbox = datas.get("seed_textbox", 43)
+        
+                ref_image = datas.get('ref_image', None)
+                enable_teacache = datas.get('enable_teacache', True)
+                teacache_threshold = datas.get('teacache_threshold', 0.10)
+                num_skip_start_steps = datas.get('num_skip_start_steps', 1)
+                teacache_offload = datas.get('teacache_offload', False)
+                cfg_skip_ratio = datas.get('cfg_skip_ratio', 0)
+                enable_riflex = datas.get('enable_riflex', False)
+                riflex_k = datas.get('riflex_k', 6)
 
                 generation_method = "Image Generation" if is_image else generation_method
 
                 if start_image is not None:
                     if start_image.startswith('http'):
-                        start_image = save_url_image(start_image)
-                        start_image = [Image.open(start_image)]
+                        start_image = save_url_image_dist(start_image)
+                        start_image = [Image.open(start_image).convert("RGB")]
                     else:
                         start_image = base64.b64decode(start_image)
-                        start_image = [Image.open(BytesIO(start_image))]
+                        start_image = [Image.open(BytesIO(start_image)).convert("RGB")]
 
                 if end_image is not None:
                     if end_image.startswith('http'):
-                        end_image = save_url_image(end_image)
-                        end_image = [Image.open(end_image)]
+                        end_image = save_url_image_dist(end_image)
+                        end_image = [Image.open(end_image).convert("RGB")]
                     else:
                         end_image = base64.b64decode(end_image)
-                        end_image = [Image.open(BytesIO(end_image))]
+                        end_image = [Image.open(BytesIO(end_image)).convert("RGB")]
                         
                 if validation_video is not None:
                     if validation_video.startswith('http'):
-                        validation_video = save_url_video(validation_video)
+                        validation_video = save_url_video_dist(validation_video)
                     else:
-                        validation_video = save_base64_video(validation_video)
+                        validation_video = save_base64_video_dist(validation_video)
 
                 if validation_video_mask is not None:
                     if validation_video_mask.startswith('http'):
-                        validation_video_mask = save_url_image(validation_video_mask)
+                        validation_video_mask = save_url_image_dist(validation_video_mask)
                     else:
-                        validation_video_mask = save_base64_image(validation_video_mask)
+                        validation_video_mask = save_base64_image_dist(validation_video_mask)
 
                 if control_video is not None:
                     if control_video.startswith('http'):
-                        control_video = save_url_video(control_video)
+                        control_video = save_url_video_dist(control_video)
                     else:
-                        control_video = save_base64_video(control_video)
+                        control_video = save_base64_video_dist(control_video)
                 
+                if ref_image is not None:
+                    if ref_image.startswith('http'):
+                        ref_image = save_url_image_dist(ref_image)
+                        ref_image = [Image.open(ref_image).convert("RGB")]
+                    else:
+                        ref_image = base64.b64decode(ref_image)
+                        ref_image = [Image.open(BytesIO(ref_image)).convert("RGB")]
+
                 try:
                     save_sample_path, comment = self.controller.generate(
                         "",
@@ -131,6 +199,14 @@ if ray is not None:
                         control_video, 
                         denoise_strength,
                         seed_textbox,
+                        ref_image = ref_image,
+                        enable_teacache = enable_teacache, 
+                        teacache_threshold = teacache_threshold, 
+                        num_skip_start_steps = num_skip_start_steps, 
+                        teacache_offload = teacache_offload, 
+                        cfg_skip_ratio = cfg_skip_ratio,
+                        enable_riflex = enable_riflex, 
+                        riflex_k = riflex_k, 
                         is_api = True,
                     )
                 except Exception as e:
@@ -139,18 +215,17 @@ if ray is not None:
                     torch.cuda.ipc_collect()
                     save_sample_path = ""
                     comment = f"Error. error information is {str(e)}"
-                    return {"message": comment}
+                    return {"message": comment, "save_sample_path": None, "base64_encoding": None}
                 
-                import torch.distributed as dist
                 if dist.get_rank() == 0:
                     if save_sample_path != "":
                         return {"message": comment, "save_sample_path": save_sample_path, "base64_encoding": encode_file_to_base64(save_sample_path)}
                     else:
-                        return {"message": comment, "save_sample_path": save_sample_path}
+                        return {"message": comment, "save_sample_path": save_sample_path, "base64_encoding": None}
                 return None
 
             except Exception as e:
-                self.logger.error(f"Error generating image: {str(e)}")
+                print(f"Error generating image: {str(e)}")
                 raise HTTPException(status_code=500, detail=str(e))
 
     class MultiNodesEngine:
@@ -165,10 +240,6 @@ if ray is not None:
             config_path,
             ulysses_degree, 
             ring_degree, 
-            enable_teacache, 
-            teacache_threshold, 
-            num_skip_start_steps, 
-            teacache_offload, 
             weight_dtype,
             savedir_sample
         ):
@@ -181,8 +252,7 @@ if ray is not None:
                 MultiNodesGenerator.remote(
                     rank, world_size, Controller, 
                     GPU_memory_mode, scheduler_dict, model_name=model_name, model_type=model_type, config_path=config_path, 
-                    ulysses_degree=ulysses_degree, ring_degree=ring_degree, enable_teacache=enable_teacache, teacache_threshold=teacache_threshold, num_skip_start_steps=num_skip_start_steps, 
-                    teacache_offload=teacache_offload, weight_dtype=weight_dtype, savedir_sample=savedir_sample,
+                    ulysses_degree=ulysses_degree, ring_degree=ring_degree, weight_dtype=weight_dtype, savedir_sample=savedir_sample,
                 )
                 for rank in range(num_workers)
             ]

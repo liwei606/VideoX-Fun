@@ -17,7 +17,7 @@ from ..pipeline import (CogVideoXFunControlPipeline,
                         CogVideoXFunInpaintPipeline, CogVideoXFunPipeline)
 from ..utils.fp8_optimization import convert_weight_dtype_wrapper
 from ..utils.lora_utils import merge_lora, unmerge_lora
-from ..utils.utils import (get_image_to_video_latent,
+from ..utils.utils import (filter_kwargs, get_image_to_video_latent, get_image_latent, timer,
                            get_video_to_video_latent, save_videos_grid)
 from .controller import (Fun_Controller, Fun_Controller_Client,
                          all_cheduler_dict, css, ddpm_scheduler_dict,
@@ -36,7 +36,7 @@ from .ui import (create_cfg_and_seedbox,
 
 class CogVideoXFunController(Fun_Controller):
     def update_diffusion_transformer(self, diffusion_transformer_dropdown):
-        print("Update diffusion transformer")
+        print(f"Update diffusion transformer: {diffusion_transformer_dropdown}")
         self.diffusion_transformer_dropdown = diffusion_transformer_dropdown
         if diffusion_transformer_dropdown == "none":
             return gr.update()
@@ -97,11 +97,15 @@ class CogVideoXFunController(Fun_Controller):
             self.pipeline.enable_model_cpu_offload(device=self.device)
         elif self.GPU_memory_mode == "model_cpu_offload":
             self.pipeline.enable_model_cpu_offload(device=self.device)
+        elif self.GPU_memory_mode == "model_full_load_and_qfloat8":
+            convert_weight_dtype_wrapper(self.pipeline.transformer, self.weight_dtype)
+            self.pipeline.enable_model_cpu_offload(device=self.device)
         else:
             self.pipeline.to(self.device)
         print("Update diffusion transformer done")
         return gr.update()
 
+    @timer
     def generate(
         self,
         diffusion_transformer_dropdown,
@@ -128,13 +132,25 @@ class CogVideoXFunController(Fun_Controller):
         control_video,
         denoise_strength,
         seed_textbox,
+        ref_image = None,
+        enable_teacache = None, 
+        teacache_threshold = None, 
+        num_skip_start_steps = None, 
+        teacache_offload = None, 
+        cfg_skip_ratio = None,
+        enable_riflex = None, 
+        riflex_k = None, 
         is_api = False,
     ):
         self.clear_cache()
 
-        self.input_check(
+        print(f"Input checking.")
+        _, comment = self.input_check(
             resize_method, generation_method, start_image, end_image, validation_video,control_video, is_api
         )
+        print(f"Input checking down")
+        if comment != "OK":
+            return "", comment
         is_image = True if generation_method == "Image Generation" else False
 
         if self.base_model_path != base_model_dropdown:
@@ -143,21 +159,29 @@ class CogVideoXFunController(Fun_Controller):
         if self.lora_model_path != lora_model_dropdown:
             self.update_lora_model(lora_model_dropdown)
 
+        print(f"Load scheduler.")
         self.pipeline.scheduler = self.scheduler_dict[sampler_dropdown].from_config(self.pipeline.scheduler.config)
+        print(f"Load scheduler down.")
 
         if resize_method == "Resize according to Reference":
+            print(f"Calculate height and width according to Reference.")
             height_slider, width_slider = self.get_height_width_from_reference(
                 base_resolution, start_image, validation_video, control_video,
             )
-        if self.lora_model_path != "none":
-            # lora part
-            self.pipeline = merge_lora(self.pipeline, self.lora_model_path, multiplier=lora_alpha_slider)
 
+        if self.lora_model_path != "none":
+            print(f"Merge Lora.")
+            self.pipeline = merge_lora(self.pipeline, self.lora_model_path, multiplier=lora_alpha_slider)
+            print(f"Merge Lora done.")
+
+        print(f"Generate seed.")
         if int(seed_textbox) != -1 and seed_textbox != "": torch.manual_seed(int(seed_textbox))
         else: seed_textbox = np.random.randint(0, 1e10)
         generator = torch.Generator(device=self.device).manual_seed(int(seed_textbox))
+        print(f"Generate seed done.")
         
         try:
+            print(f"Generation.")
             if self.model_type == "Inpaint":
                 if self.transformer.config.in_channels != self.vae.config.latent_channels:
                     if generation_method == "Long Video Generation":
@@ -270,6 +294,7 @@ class CogVideoXFunController(Fun_Controller):
                 ).videos
         except Exception as e:
             self.clear_cache()
+            print(f"Error. error information is {str(e)}")
             if self.lora_model_path != "none":
                 self.pipeline = unmerge_lora(self.pipeline, self.lora_model_path, multiplier=lora_alpha_slider)
             if is_api:
@@ -280,11 +305,15 @@ class CogVideoXFunController(Fun_Controller):
         self.clear_cache()
         # lora part
         if self.lora_model_path != "none":
+            print(f"Unmerge Lora.")
             self.pipeline = unmerge_lora(self.pipeline, self.lora_model_path, multiplier=lora_alpha_slider)
+            print(f"Unmerge Lora done.")
 
+        print(f"Saving outputs.")
         save_sample_path = self.save_outputs(
             is_image, length_slider, sample, fps=8
         )
+        print(f"Saving outputs done.")
 
         if is_image or length_slider == 1:
             if is_api:
@@ -456,7 +485,7 @@ def ui_host(GPU_memory_mode, scheduler_dict, model_name, model_type, ulysses_deg
             """
         )
         with gr.Column(variant="panel"):
-            model_type = create_fake_model_type(visible=True)
+            model_type = create_fake_model_type(visible=False)
             diffusion_transformer_dropdown = create_fake_model_checkpoints(model_name, visible=True)
             base_model_dropdown, lora_model_dropdown, lora_alpha_slider = create_fake_finetune_models_checkpoints(visible=True)
         

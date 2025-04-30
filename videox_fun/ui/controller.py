@@ -24,6 +24,8 @@ from safetensors import safe_open
 
 from ..data.bucket_sampler import ASPECT_RATIO_512, get_closest_ratio
 from ..utils.utils import save_videos_grid
+from ..utils.fm_solvers import FlowDPMSolverMultistepScheduler
+from ..utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from ..dist import set_multi_gpus_devices
 
 gradio_version = pkg_resources.get_distribution("gradio").version
@@ -49,16 +51,15 @@ ddpm_scheduler_dict = {
 }
 flow_scheduler_dict = {
     "Flow": FlowMatchEulerDiscreteScheduler,
+    "Flow_Unipc": FlowUniPCMultistepScheduler,
+    "Flow_DPM++": FlowDPMSolverMultistepScheduler,
 }
 all_cheduler_dict = {**ddpm_scheduler_dict, **flow_scheduler_dict}
 
 class Fun_Controller:
     def __init__(
         self, GPU_memory_mode, scheduler_dict, model_name=None, model_type="Inpaint", 
-        config_path=None, ulysses_degree=1, ring_degree=1,
-        enable_teacache=None, teacache_threshold=None, 
-        num_skip_start_steps=None, teacache_offload=None,
-        enable_riflex=None, riflex_k=None, weight_dtype=None, savedir_sample=None,
+        config_path=None, ulysses_degree=1, ring_degree=1, weight_dtype=None, savedir_sample=None,
     ):
         # config dirs
         self.basedir                    = os.getcwd()
@@ -72,20 +73,15 @@ class Fun_Controller:
             self.savedir_sample         = savedir_sample
         os.makedirs(self.savedir_sample, exist_ok=True)
 
-        self.GPU_memory_mode            = GPU_memory_mode
-        self.model_name                 = model_name
+        self.GPU_memory_mode                = GPU_memory_mode
+        self.model_name                     = model_name
+        self.diffusion_transformer_dropdown = model_name
         self.scheduler_dict             = scheduler_dict
         self.model_type                 = model_type
         if config_path is not None:
             self.config = OmegaConf.load(config_path)
         self.ulysses_degree             = ulysses_degree
         self.ring_degree                = ring_degree
-        self.enable_teacache            = enable_teacache
-        self.teacache_threshold         = teacache_threshold
-        self.num_skip_start_steps       = num_skip_start_steps
-        self.teacache_offload           = teacache_offload
-        self.enable_riflex              = enable_riflex
-        self.riflex_k                   = riflex_k
         self.weight_dtype               = weight_dtype
         self.device                     = set_multi_gpus_devices(self.ulysses_degree, self.ring_degree)
 
@@ -122,11 +118,12 @@ class Fun_Controller:
 
     def update_base_model(self, base_model_dropdown):
         self.base_model_path = base_model_dropdown
-        print("Update base model")
+        print(f"Update base model: {base_model_dropdown}")
         if base_model_dropdown == "none":
             return gr.update()
         if self.transformer is None:
             gr.Info(f"Please select a pretrained model path.")
+            print(f"Please select a pretrained model path.")
             return gr.update(value=None)
         else:
             base_model_dropdown = os.path.join(self.personalized_model_dir, base_model_dropdown)
@@ -135,11 +132,11 @@ class Fun_Controller:
                 for key in f.keys():
                     base_model_state_dict[key] = f.get_tensor(key)
             self.transformer.load_state_dict(base_model_state_dict, strict=False)
-            print("Update base done")
+            print("Update base model done")
             return gr.update()
 
     def update_lora_model(self, lora_model_dropdown):
-        print("Update lora model")
+        print(f"Update lora model: {lora_model_dropdown}")
         if lora_model_dropdown == "none":
             self.lora_model_path = "none"
             return gr.update()
@@ -162,7 +159,10 @@ class Fun_Controller:
         is_api = False,
     ):
         if self.transformer is None:
-            raise gr.Error(f"Please select a pretrained model path.")
+            if is_api:
+                return "", f"Please select a pretrained model path."
+            else:
+                raise gr.Error(f"Please select a pretrained model path.")
         
         if control_video is not None and self.model_type == "Inpaint":
             if is_api:
@@ -200,6 +200,7 @@ class Fun_Controller:
                 return "", f"If specifying the ending image of the video, please specify a starting image of the video."
             else:
                 raise gr.Error(f"If specifying the ending image of the video, please specify a starting image of the video.")
+        return "", "OK"
 
     def get_height_width_from_reference(
         self,
@@ -277,6 +278,13 @@ class Fun_Controller:
         control_video,
         denoise_strength,
         seed_textbox,
+        enable_teacache = None, 
+        teacache_threshold = None, 
+        num_skip_start_steps = None, 
+        teacache_offload = None, 
+        cfg_skip_ratio = None,
+        enable_riflex = None, 
+        riflex_k = None, 
         is_api = False,
     ):
         pass
@@ -288,6 +296,8 @@ def post_to_host(
     sampler_dropdown, sample_step_slider, resize_method, width_slider, height_slider,
     base_resolution, generation_method, length_slider, cfg_scale_slider, 
     start_image, end_image, validation_video, validation_video_mask, denoise_strength, seed_textbox,
+    ref_image = None, enable_teacache = None, teacache_threshold = None, num_skip_start_steps = None, 
+    teacache_offload = None, cfg_skip_ratio = None,enable_riflex = None, riflex_k = None, 
 ):
     if start_image is not None:
         with open(start_image, 'rb') as file:
@@ -313,6 +323,12 @@ def post_to_host(
             validation_video_mask_encoded_content = base64.b64encode(file_content)
             validation_video_mask = validation_video_mask_encoded_content.decode('utf-8')
 
+    if ref_image is not None:
+        with open(ref_image, 'rb') as file:
+            file_content = file.read()
+            ref_image_encoded_content = base64.b64encode(file_content)
+            ref_image = ref_image_encoded_content.decode('utf-8')
+
     datas = {
         "base_model_path": base_model_dropdown,
         "lora_model_path": lora_model_dropdown, 
@@ -334,12 +350,21 @@ def post_to_host(
         "validation_video_mask": validation_video_mask,
         "denoise_strength": denoise_strength,
         "seed_textbox": seed_textbox,
+
+        "ref_image": ref_image,
+        "enable_teacache": enable_teacache,
+        "teacache_threshold": teacache_threshold,
+        "num_skip_start_steps": num_skip_start_steps,
+        "teacache_offload": teacache_offload,
+        "cfg_skip_ratio": cfg_skip_ratio,
+        "enable_riflex": enable_riflex,
+        "riflex_k": riflex_k,
     }
 
     session = requests.session()
     session.headers.update({"Authorization": os.environ.get("EAS_TOKEN")})
 
-    response = session.post(url=f'{os.environ.get("EAS_URL")}/cogvideox_fun/infer_forward', json=datas, timeout=300)
+    response = session.post(url=f'{os.environ.get("EAS_URL")}/videox_fun/infer_forward', json=datas, timeout=300)
 
     outputs = response.json()
     return outputs
@@ -378,7 +403,15 @@ class Fun_Controller_Client:
         validation_video, 
         validation_video_mask, 
         denoise_strength,
-        seed_textbox
+        seed_textbox,
+        ref_image = None,
+        enable_teacache = None, 
+        teacache_threshold = None, 
+        num_skip_start_steps = None, 
+        teacache_offload = None, 
+        cfg_skip_ratio = None,
+        enable_riflex = None, 
+        riflex_k = None, 
     ):
         is_image = True if generation_method == "Image Generation" else False
 
@@ -389,8 +422,11 @@ class Fun_Controller_Client:
             sampler_dropdown, sample_step_slider, resize_method, width_slider, height_slider,
             base_resolution, generation_method, length_slider, cfg_scale_slider, 
             start_image, end_image, validation_video, validation_video_mask, denoise_strength, 
-            seed_textbox
+            seed_textbox, ref_image = ref_image, enable_teacache = enable_teacache, teacache_threshold = teacache_threshold, 
+            num_skip_start_steps = num_skip_start_steps, teacache_offload = teacache_offload, 
+            cfg_skip_ratio = cfg_skip_ratio, enable_riflex = enable_riflex, riflex_k = riflex_k, 
         )
+        print(outputs)
         try:
             base64_encoding = outputs["base64_encoding"]
         except:

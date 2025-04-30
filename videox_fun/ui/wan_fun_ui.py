@@ -15,18 +15,20 @@ from ..data.bucket_sampler import ASPECT_RATIO_512, get_closest_ratio
 from ..models import (AutoencoderKLWan, AutoTokenizer, CLIPModel,
                       WanT5EncoderModel, WanTransformer3DModel)
 from ..models.cache_utils import get_teacache_coefficients
-from ..pipeline import WanFunInpaintPipeline, WanFunPipeline, WanFunControlPipeline
+from ..pipeline import (WanFunControlPipeline, WanFunInpaintPipeline,
+                        WanFunPipeline)
 from ..utils.fp8_optimization import (convert_model_weight_to_float8,
                                       convert_weight_dtype_wrapper,
                                       replace_parameters_by_name)
 from ..utils.lora_utils import merge_lora, unmerge_lora
-from ..utils.utils import (filter_kwargs, get_image_to_video_latent,
+from ..utils.utils import (filter_kwargs, get_image_to_video_latent, get_image_latent, timer,
                            get_video_to_video_latent, save_videos_grid)
 from .controller import (Fun_Controller, Fun_Controller_Client,
                          all_cheduler_dict, css, ddpm_scheduler_dict,
                          flow_scheduler_dict, gradio_version,
                          gradio_version_is_above_4)
-from .ui import (create_cfg_and_seedbox,
+from .ui import (create_cfg_and_seedbox, create_cfg_riflex_k,
+                 create_cfg_skip_params,
                  create_fake_finetune_models_checkpoints,
                  create_fake_height_width, create_fake_model_checkpoints,
                  create_fake_model_type, create_finetune_models_checkpoints,
@@ -34,12 +36,13 @@ from .ui import (create_cfg_and_seedbox,
                  create_generation_methods_and_video_length,
                  create_height_width, create_model_checkpoints,
                  create_model_type, create_prompts, create_samplers,
-                 create_ui_outputs)
+                 create_teacache_params, create_ui_outputs)
 
 
 class Wan_Fun_Controller(Fun_Controller):
     def update_diffusion_transformer(self, diffusion_transformer_dropdown):
-        print("Update diffusion transformer")
+        print(f"Update diffusion transformer: {diffusion_transformer_dropdown}")
+        self.model_name = diffusion_transformer_dropdown
         self.diffusion_transformer_dropdown = diffusion_transformer_dropdown
         if diffusion_transformer_dropdown == "none":
             return gr.update()
@@ -126,11 +129,16 @@ class Wan_Fun_Controller(Fun_Controller):
             self.pipeline.enable_model_cpu_offload(device=self.device)
         elif self.GPU_memory_mode == "model_cpu_offload":
             self.pipeline.enable_model_cpu_offload(device=self.device)
+        elif self.GPU_memory_mode == "model_full_load_and_qfloat8":
+            convert_model_weight_to_float8(self.transformer, exclude_module_name=["modulation",])
+            convert_weight_dtype_wrapper(self.transformer, self.weight_dtype)
+            self.pipeline.to(device=self.device)
         else:
             self.pipeline.to(self.device)
         print("Update diffusion transformer done")
         return gr.update()
 
+    @timer
     def generate(
         self,
         diffusion_transformer_dropdown,
@@ -157,13 +165,25 @@ class Wan_Fun_Controller(Fun_Controller):
         control_video,
         denoise_strength,
         seed_textbox,
+        ref_image = None,
+        enable_teacache = None, 
+        teacache_threshold = None, 
+        num_skip_start_steps = None, 
+        teacache_offload = None, 
+        cfg_skip_ratio = None,
+        enable_riflex = None, 
+        riflex_k = None, 
         is_api = False,
     ):
         self.clear_cache()
 
-        self.input_check(
+        print(f"Input checking.")
+        _, comment = self.input_check(
             resize_method, generation_method, start_image, end_image, validation_video,control_video, is_api
         )
+        print(f"Input checking down")
+        if comment != "OK":
+            return "", comment
         is_image = True if generation_method == "Image Generation" else False
 
         if self.base_model_path != base_model_dropdown:
@@ -172,38 +192,51 @@ class Wan_Fun_Controller(Fun_Controller):
         if self.lora_model_path != lora_model_dropdown:
             self.update_lora_model(lora_model_dropdown)
 
-        self.pipeline.scheduler = self.scheduler_dict[sampler_dropdown].from_config(self.pipeline.scheduler.config)
+        print(f"Load scheduler.")
+        scheduler_config = self.pipeline.scheduler.config
+        if sampler_dropdown == "Flow_Unipc" or sampler_dropdown == "Flow_DPM++":
+            scheduler_config['shift'] = 1
+        self.pipeline.scheduler = self.scheduler_dict[sampler_dropdown].from_config(scheduler_config)
+        print(f"Load scheduler down.")
 
         if resize_method == "Resize according to Reference":
+            print(f"Calculate height and width according to Reference.")
             height_slider, width_slider = self.get_height_width_from_reference(
                 base_resolution, start_image, validation_video, control_video,
             )
-        if self.lora_model_path != "none":
-            # lora part
-            self.pipeline = merge_lora(self.pipeline, self.lora_model_path, multiplier=lora_alpha_slider)
 
-        coefficients = get_teacache_coefficients(self.base_model_path) if self.enable_teacache else None
+        if self.lora_model_path != "none":
+            print(f"Merge Lora.")
+            self.pipeline = merge_lora(self.pipeline, self.lora_model_path, multiplier=lora_alpha_slider)
+            print(f"Merge Lora done.")
+
+        coefficients = get_teacache_coefficients(self.diffusion_transformer_dropdown) if enable_teacache else None
         if coefficients is not None:
-            print(f"Enable TeaCache with threshold {self.teacache_threshold} and skip the first {self.num_skip_start_steps} steps.")
+            print(f"Enable TeaCache with threshold {teacache_threshold} and skip the first {num_skip_start_steps} steps.")
             self.pipeline.transformer.enable_teacache(
-                coefficients, sample_step_slider, self.teacache_threshold, num_skip_start_steps=self.num_skip_start_steps, offload=self.teacache_offload
+                coefficients, sample_step_slider, teacache_threshold, num_skip_start_steps=num_skip_start_steps, offload=teacache_offload
             )
         else:
+            print(f"Disable TeaCache.")
             self.pipeline.transformer.disable_teacache()
-
+            
+        print(f"Generate seed.")
         if int(seed_textbox) != -1 and seed_textbox != "": torch.manual_seed(int(seed_textbox))
         else: seed_textbox = np.random.randint(0, 1e10)
         generator = torch.Generator(device=self.device).manual_seed(int(seed_textbox))
+        print(f"Generate seed done.")
         
-        if self.enable_riflex:
+        if enable_riflex:
+            print(f"Enable riflex")
             latent_frames = (int(length_slider) - 1) // self.vae.config.temporal_compression_ratio + 1
-            self.pipeline.transformer.enable_riflex(k = self.riflex_k, L_test = latent_frames if not is_image else 1)
+            self.pipeline.transformer.enable_riflex(k = riflex_k, L_test = latent_frames if not is_image else 1)
 
         try:
+            print(f"Generation.")
             if self.model_type == "Inpaint":
                 if self.transformer.config.in_channels != self.vae.config.latent_channels:
                     if validation_video is not None:
-                        input_video, input_video_mask, ref_image, clip_image = get_video_to_video_latent(validation_video, length_slider if not is_image else 1, sample_size=(height_slider, width_slider), validation_video_mask=validation_video_mask, fps=16)
+                        input_video, input_video_mask, _, clip_image = get_video_to_video_latent(validation_video, length_slider if not is_image else 1, sample_size=(height_slider, width_slider), validation_video_mask=validation_video_mask, fps=16)
                     else:
                         input_video, input_video_mask, clip_image = get_image_to_video_latent(start_image, end_image, length_slider if not is_image else 1, sample_size=(height_slider, width_slider))
 
@@ -217,9 +250,10 @@ class Wan_Fun_Controller(Fun_Controller):
                         num_frames          = length_slider if not is_image else 1,
                         generator           = generator,
 
-                        video        = input_video,
-                        mask_video   = input_video_mask,
-                        clip_image   = clip_image
+                        video               = input_video,
+                        mask_video          = input_video_mask,
+                        clip_image          = clip_image,
+                        cfg_skip_ratio      = cfg_skip_ratio,
                     ).videos
                 else:
                     sample = self.pipeline(
@@ -230,10 +264,24 @@ class Wan_Fun_Controller(Fun_Controller):
                         width               = width_slider,
                         height              = height_slider,
                         num_frames          = length_slider if not is_image else 1,
-                        generator           = generator
+                        generator           = generator,
+                        cfg_skip_ratio      = cfg_skip_ratio,
                     ).videos
             else:
-                input_video, input_video_mask, ref_image, clip_image = get_video_to_video_latent(control_video, length_slider if not is_image else 1, sample_size=(height_slider, width_slider), fps=16)
+                if ref_image is not None:
+                    clip_image = Image.open(ref_image).convert("RGB")
+                elif start_image is not None:
+                    clip_image = Image.open(start_image).convert("RGB")
+                else:
+                    clip_image = None
+                
+                if ref_image is not None:
+                    ref_image = get_image_latent(ref_image, sample_size=(height_slider, width_slider))
+                
+                if start_image is not None:
+                    start_image = get_image_latent(start_image, sample_size=(height_slider, width_slider))
+
+                input_video, input_video_mask, _, _ = get_video_to_video_latent(control_video, video_length=length_slider if not is_image else 1, sample_size=(height_slider, width_slider), fps=16, ref_image=None)
 
                 sample = self.pipeline(
                     prompt_textbox,
@@ -246,9 +294,15 @@ class Wan_Fun_Controller(Fun_Controller):
                     generator           = generator,
 
                     control_video = input_video,
+                    ref_image = ref_image,
+                    start_image = start_image,
+                    clip_image = clip_image,
+                    cfg_skip_ratio = cfg_skip_ratio,
                 ).videos
+            print(f"Generation done.")
         except Exception as e:
             self.clear_cache()
+            print(f"Error. error information is {str(e)}")
             if self.lora_model_path != "none":
                 self.pipeline = unmerge_lora(self.pipeline, self.lora_model_path, multiplier=lora_alpha_slider)
             if is_api:
@@ -259,11 +313,15 @@ class Wan_Fun_Controller(Fun_Controller):
         self.clear_cache()
         # lora part
         if self.lora_model_path != "none":
+            print(f"Unmerge Lora.")
             self.pipeline = unmerge_lora(self.pipeline, self.lora_model_path, multiplier=lora_alpha_slider)
+            print(f"Unmerge Lora done.")
 
+        print(f"Saving outputs.")
         save_sample_path = self.save_outputs(
             is_image, length_slider, sample, fps=16
         )
+        print(f"Saving outputs done.")
 
         if is_image or length_slider == 1:
             if is_api:
@@ -285,14 +343,11 @@ class Wan_Fun_Controller(Fun_Controller):
 Wan_Fun_Controller_Host = Wan_Fun_Controller
 Wan_Fun_Controller_Client = Fun_Controller_Client
 
-def ui(GPU_memory_mode, scheduler_dict, config_path, ulysses_degree, ring_degree, enable_teacache, teacache_threshold, num_skip_start_steps, teacache_offload, enable_riflex, riflex_k, weight_dtype, savedir_sample=None):
+def ui(GPU_memory_mode, scheduler_dict, config_path, ulysses_degree, ring_degree, weight_dtype, savedir_sample=None):
     controller = Wan_Fun_Controller(
         GPU_memory_mode, scheduler_dict, model_name=None, model_type="Inpaint", 
         config_path=config_path, ulysses_degree=ulysses_degree, ring_degree=ring_degree,
-        enable_teacache=enable_teacache, teacache_threshold=teacache_threshold, 
-        num_skip_start_steps=num_skip_start_steps, teacache_offload=teacache_offload, 
-        enable_riflex=enable_riflex, riflex_k=riflex_k, weight_dtype=weight_dtype, 
-        savedir_sample=savedir_sample,
+        weight_dtype=weight_dtype, savedir_sample=savedir_sample,
     )
 
     with gr.Blocks(css=css) as demo:
@@ -311,6 +366,12 @@ def ui(GPU_memory_mode, scheduler_dict, config_path, ulysses_degree, ring_degree
                 create_model_checkpoints(controller, visible=True)
             base_model_dropdown, lora_model_dropdown, lora_alpha_slider, personalized_refresh_button = \
                 create_finetune_models_checkpoints(controller, visible=True)
+            
+            with gr.Row():
+                enable_teacache, teacache_threshold, num_skip_start_steps, teacache_offload = \
+                    create_teacache_params(True, 0.10, 1, False)
+                cfg_skip_ratio = create_cfg_skip_params(0)
+                enable_riflex, riflex_k = create_cfg_riflex_k(False, 6)
 
         with gr.Column(variant="panel"):
             prompt_textbox, negative_prompt_textbox = create_prompts(negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走")
@@ -327,10 +388,10 @@ def ui(GPU_memory_mode, scheduler_dict, config_path, ulysses_degree, ring_degree
                         create_generation_methods_and_video_length(
                             ["Video Generation", "Image Generation"],
                             default_video_length=81,
-                            maximum_video_length=81,
+                            maximum_video_length=161,
                         )
-                    image_to_video_col, video_to_video_col, control_video_col, source_method, start_image, template_gallery, end_image, validation_video, validation_video_mask, denoise_strength, control_video = create_generation_method(
-                        ["Text to Video (文本到视频)", "Image to Video (图片到视频)"], prompt_textbox
+                    image_to_video_col, video_to_video_col, control_video_col, source_method, start_image, template_gallery, end_image, validation_video, validation_video_mask, denoise_strength, control_video, ref_image = create_generation_method(
+                        ["Text to Video (文本到视频)", "Image to Video (图片到视频)", "Video Control (视频控制)"], prompt_textbox, support_ref_image=True
                     )
                     cfg_scale_slider, seed_textbox, seed_button = create_cfg_and_seedbox(gradio_version_is_above_4)
 
@@ -346,7 +407,7 @@ def ui(GPU_memory_mode, scheduler_dict, config_path, ulysses_degree, ring_degree
 
             def upload_generation_method(generation_method):
                 if generation_method == "Video Generation":
-                    return [gr.update(visible=True, maximum=81, value=81, interactive=True), gr.update(visible=False), gr.update(visible=False)]
+                    return [gr.update(visible=True, maximum=161, value=81, interactive=True), gr.update(visible=False), gr.update(visible=False)]
                 elif generation_method == "Image Generation":
                     return [gr.update(minimum=1, maximum=1, value=1, interactive=False), gr.update(visible=False), gr.update(visible=False)]
                 else:
@@ -407,19 +468,24 @@ def ui(GPU_memory_mode, scheduler_dict, config_path, ulysses_degree, ring_degree
                     control_video,
                     denoise_strength, 
                     seed_textbox,
+                    ref_image, 
+                    enable_teacache, 
+                    teacache_threshold, 
+                    num_skip_start_steps, 
+                    teacache_offload, 
+                    cfg_skip_ratio,
+                    enable_riflex, 
+                    riflex_k, 
                 ],
                 outputs=[result_image, result_video, infer_progress]
             )
     return demo, controller
 
-def ui_host(GPU_memory_mode, scheduler_dict, model_name, model_type, config_path, ulysses_degree, ring_degree, enable_teacache, teacache_threshold, num_skip_start_steps, teacache_offload, enable_riflex, riflex_k, weight_dtype, savedir_sample=None):
+def ui_host(GPU_memory_mode, scheduler_dict, model_name, model_type, config_path, ulysses_degree, ring_degree, weight_dtype, savedir_sample=None):
     controller = Wan_Fun_Controller_Host(
         GPU_memory_mode, scheduler_dict, model_name=model_name, model_type=model_type, 
         config_path=config_path, ulysses_degree=ulysses_degree, ring_degree=ring_degree,
-        enable_teacache=enable_teacache, teacache_threshold=teacache_threshold, 
-        num_skip_start_steps=num_skip_start_steps, teacache_offload=teacache_offload, 
-        enable_riflex=enable_riflex, riflex_k=riflex_k, weight_dtype=weight_dtype, 
-        savedir_sample=savedir_sample,
+        weight_dtype=weight_dtype, savedir_sample=savedir_sample,
     )
 
     with gr.Blocks(css=css) as demo:
@@ -433,9 +499,15 @@ def ui_host(GPU_memory_mode, scheduler_dict, model_name, model_type, config_path
             """
         )
         with gr.Column(variant="panel"):
-            model_type = create_fake_model_type(visible=True)
+            model_type = create_fake_model_type(visible=False)
             diffusion_transformer_dropdown = create_fake_model_checkpoints(model_name, visible=True)
             base_model_dropdown, lora_model_dropdown, lora_alpha_slider = create_fake_finetune_models_checkpoints(visible=True)
+
+            with gr.Row():
+                enable_teacache, teacache_threshold, num_skip_start_steps, teacache_offload = \
+                    create_teacache_params(True, 0.10, 1, False)
+                cfg_skip_ratio = create_cfg_skip_params(0)
+                enable_riflex, riflex_k = create_cfg_riflex_k(False, 6)
         
         with gr.Column(variant="panel"):
             prompt_textbox, negative_prompt_textbox = create_prompts(negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走")
@@ -452,10 +524,10 @@ def ui_host(GPU_memory_mode, scheduler_dict, model_name, model_type, config_path
                         create_generation_methods_and_video_length(
                             ["Video Generation", "Image Generation"],
                             default_video_length=81,
-                            maximum_video_length=81,
+                            maximum_video_length=161,
                         )
-                    image_to_video_col, video_to_video_col, control_video_col, source_method, start_image, template_gallery, end_image, validation_video, validation_video_mask, denoise_strength, control_video = create_generation_method(
-                        ["Text to Video (文本到视频)", "Image to Video (图片到视频)"], prompt_textbox
+                    image_to_video_col, video_to_video_col, control_video_col, source_method, start_image, template_gallery, end_image, validation_video, validation_video_mask, denoise_strength, control_video, ref_image = create_generation_method(
+                        ["Text to Video (文本到视频)", "Image to Video (图片到视频)", "Video Control (视频控制)"], prompt_textbox, support_ref_image=True
                     )
                     cfg_scale_slider, seed_textbox, seed_button = create_cfg_and_seedbox(gradio_version_is_above_4)
 
@@ -465,7 +537,7 @@ def ui_host(GPU_memory_mode, scheduler_dict, model_name, model_type, config_path
 
             def upload_generation_method(generation_method):
                 if generation_method == "Video Generation":
-                    return gr.update(visible=True, minimum=1, maximum=81, value=81, interactive=True)
+                    return gr.update(visible=True, minimum=1, maximum=161, value=81, interactive=True)
                 elif generation_method == "Image Generation":
                     return gr.update(minimum=1, maximum=1, value=1, interactive=False)
             generation_method.change(
@@ -524,6 +596,14 @@ def ui_host(GPU_memory_mode, scheduler_dict, model_name, model_type, config_path
                     control_video,
                     denoise_strength, 
                     seed_textbox,
+                    ref_image, 
+                    enable_teacache, 
+                    teacache_threshold, 
+                    num_skip_start_steps, 
+                    teacache_offload, 
+                    cfg_skip_ratio,
+                    enable_riflex, 
+                    riflex_k, 
                 ],
                 outputs=[result_image, result_video, infer_progress]
             )
@@ -545,6 +625,12 @@ def ui_client(scheduler_dict, model_name, savedir_sample=None):
         with gr.Column(variant="panel"):
             diffusion_transformer_dropdown = create_fake_model_checkpoints(model_name, visible=True)
             base_model_dropdown, lora_model_dropdown, lora_alpha_slider = create_fake_finetune_models_checkpoints(visible=True)
+
+            with gr.Row():
+                enable_teacache, teacache_threshold, num_skip_start_steps, teacache_offload = \
+                    create_teacache_params(True, 0.10, 1, False)
+                cfg_skip_ratio = create_cfg_skip_params(0)
+                enable_riflex, riflex_k = create_cfg_riflex_k(False, 6)
         
         with gr.Column(variant="panel"):
             prompt_textbox, negative_prompt_textbox = create_prompts(negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走")
@@ -561,9 +647,9 @@ def ui_client(scheduler_dict, model_name, savedir_sample=None):
                         create_generation_methods_and_video_length(
                             ["Video Generation", "Image Generation"],
                             default_video_length=81,
-                            maximum_video_length=81,
+                            maximum_video_length=161,
                         )
-                    image_to_video_col, video_to_video_col, control_video_col, source_method, start_image, template_gallery, end_image, validation_video, validation_video_mask, denoise_strength, control_video = create_generation_method(
+                    image_to_video_col, video_to_video_col, control_video_col, source_method, start_image, template_gallery, end_image, validation_video, validation_video_mask, denoise_strength, control_video, ref_image = create_generation_method(
                         ["Text to Video (文本到视频)", "Image to Video (图片到视频)"], prompt_textbox
                     )
 
@@ -575,7 +661,7 @@ def ui_client(scheduler_dict, model_name, savedir_sample=None):
 
             def upload_generation_method(generation_method):
                 if generation_method == "Video Generation":
-                    return gr.update(visible=True, minimum=5, maximum=81, value=49, interactive=True)
+                    return gr.update(visible=True, minimum=5, maximum=161, value=49, interactive=True)
                 elif generation_method == "Image Generation":
                     return gr.update(minimum=1, maximum=1, value=1, interactive=False)
             generation_method.change(
@@ -626,6 +712,14 @@ def ui_client(scheduler_dict, model_name, savedir_sample=None):
                     validation_video_mask,
                     denoise_strength, 
                     seed_textbox,
+                    ref_image, 
+                    enable_teacache, 
+                    teacache_threshold, 
+                    num_skip_start_steps, 
+                    teacache_offload, 
+                    cfg_skip_ratio,
+                    enable_riflex, 
+                    riflex_k, 
                 ],
                 outputs=[result_image, result_video, infer_progress]
             )

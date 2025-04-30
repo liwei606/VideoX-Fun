@@ -29,8 +29,11 @@ from videox_fun.utils.utils import (filter_kwargs, get_image_to_video_latent, ge
 from videox_fun.utils.fm_solvers import FlowDPMSolverMultistepScheduler
 from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
-# GPU memory mode, which can be choosen in [model_full_load, model_cpu_offload, model_cpu_offload_and_qfloat8, sequential_cpu_offload].
+# GPU memory mode, which can be choosen in [model_full_load, model_full_load_and_qfloat8, model_cpu_offload, model_cpu_offload_and_qfloat8, sequential_cpu_offload].
 # model_full_load means that the entire model will be moved to the GPU.
+# 
+# model_full_load_and_qfloat8 means that the entire model will be moved to the GPU,
+# and the transformer model has been quantized to float8, which can save more GPU memory. 
 # 
 # model_cpu_offload means that the entire model will be moved to the CPU after use, which can save some GPU memory.
 # 
@@ -46,7 +49,11 @@ GPU_memory_mode     = "sequential_cpu_offload"
 # If you are using 1 GPU, you can set ulysses_degree = 1 and ring_degree = 1.
 ulysses_degree      = 1
 ring_degree         = 1
+# Use FSDP to save more GPU memory in multi gpus.
 fsdp_dit            = False
+# Compile will give a speedup in fixed resolution and need a little GPU memory. 
+# The compile_dit is not compatible with the fsdp_dit.
+compile_dit         = False
 
 # Support TeaCache.
 enable_teacache     = True
@@ -201,6 +208,12 @@ if ulysses_degree > 1 or ring_degree > 1:
     if fsdp_dit:
         shard_fn = partial(shard_model, device_id=device, param_dtype=weight_dtype)
         pipeline.transformer = shard_fn(pipeline.transformer)
+        print("Add FSDP")
+
+if compile_dit:
+    for i in range(len(pipeline.transformer.blocks)):
+        pipeline.transformer.blocks[i] = torch.compile(pipeline.transformer.blocks[i])
+    print("Add Compile")
 
 if GPU_memory_mode == "sequential_cpu_offload":
     replace_parameters_by_name(transformer, ["modulation",], device=device)
@@ -212,6 +225,10 @@ elif GPU_memory_mode == "model_cpu_offload_and_qfloat8":
     pipeline.enable_model_cpu_offload(device=device)
 elif GPU_memory_mode == "model_cpu_offload":
     pipeline.enable_model_cpu_offload(device=device)
+elif GPU_memory_mode == "model_full_load_and_qfloat8":
+    convert_model_weight_to_float8(transformer, exclude_module_name=["modulation",])
+    convert_weight_dtype_wrapper(transformer, weight_dtype)
+    pipeline.to(device=device)
 else:
     pipeline.to(device=device)
 
