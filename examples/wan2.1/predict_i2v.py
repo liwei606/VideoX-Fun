@@ -83,7 +83,7 @@ vae_path            = None
 lora_path           = None
 import argparse
 if __name__ == "__main__":
-    # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 /home/weili/miniconda3/envs/wan21_xc/bin/python 
+    # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 
     #   /home/weili/miniconda3/envs/wan21_xc/bin/torchrun --nproc-per-node 4 --master-port 25083
     #   examples/wan2.1/predict_i2v.py 
     #   --validation_config config/wan2.1/sky_i2v_1.3B.yaml 
