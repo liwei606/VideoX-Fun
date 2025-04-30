@@ -1,3 +1,31 @@
+# RealTime 1.3B VideoDIT (wan2.1_1.3B + FramePack + little sample step)
+
+## install
+follow requirements.txt to install your environment, or use /home/weili/miniconda3/envs/wan21_xc directly
+```
+pip install -r requirements.txt
+# install flash attention 3 manually
+```
+Place model under your workspace
+```
+ln -s /mnt/weka/pretrained_weights/WanPretrainWeight/* models/*
+```
+
+## How to inference?
+Using USP for faster inference (720p, 81frames, 50 step in 36s).
+Remember to modify your save path, save_dir_path
+```
+CUDA_VISIBLE_DEVICES=0,1,2,3 /home/weili/miniconda3/envs/wan21_xc/bin/torchrun --nproc-per-node 4 --master-port 25083 examples/wan2.1/predict_i2v.py --validation_config config/wan2.1/i2v_1.3B_base_infer.yaml --model_name models/SkyReels-V2-I2V-1.3B-540P --save_dir_path validations_outputs/xxx --ulysses_degree 2 --ring_degree 2
+```
+
+## How to training?
+Currently, we use "A person is speaking." as training prompt, so we can use this text embedding "xc_half_body_talkEasyPrompt.pt".
+We must use gradient_checkpointing.
+Remember to modify your save path, output_dir
+```
+CUDA_VISIBLE_DEVICES=0,1,2,3 /home/weili/miniconda3/envs/wan21_xc/bin/accelerate launch --num_processes 4 scripts/wan2.1/train.py --config_path config/wan2.1/i2v_1.3B_base_infer.yaml --enable_bucket --uniform_sampling --trainable_modules "." --preprocess_text_embed asset/xc_half_body_talkEasyPrompt.pt --train_batch_size 2 --output_dir output_dir/xxx --gradient_checkpointing
+```
+
 # VideoX-Fun
 
 😊 Welcome!
