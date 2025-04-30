@@ -1,12 +1,13 @@
 # Byte-compiled / optimized / DLL files
 models*
+output_dir/
 output*
+validations_outputs/
 logs*
 taming*
 samples*
 datasets*
 asset*
-_*
 logs*
 __pycache__/
 *.py[cod]

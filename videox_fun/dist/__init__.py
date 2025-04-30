@@ -19,8 +19,10 @@ try:
                                              get_sp_group, get_world_group,
                                              init_distributed_environment,
                                              initialize_model_parallel)
-        from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+        # from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+        from videox_fun.dist.attn_layer import xFuserLongContextAttention
 except Exception as ex:
+    import traceback;traceback.print_exc()
     get_sequence_parallel_world_size = None
     get_sequence_parallel_rank = None
     xFuserLongContextAttention = None
