@@ -4,6 +4,8 @@ from .pipeline_cogvideox_fun_inpaint import CogVideoXFunInpaintPipeline
 from .pipeline_wan_fun import WanFunPipeline
 from .pipeline_wan_fun_inpaint import WanFunInpaintPipeline
 from .pipeline_wan_fun_control import WanFunControlPipeline
+from .pipeline_wan_ai2v import WanAI2VPipeline
 
 WanPipeline = WanFunPipeline
 WanI2VPipeline = WanFunInpaintPipeline
+WanAI2VPipeline = WanAI2VPipeline

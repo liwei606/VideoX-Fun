@@ -1,15 +1,19 @@
 import os
 import sys
-
+import librosa
+import audiofile
+import ffmpeg
 import numpy as np
 import torch
 import shutil
+import copy
 import torch.distributed as dist
 
 from diffusers import FlowMatchEulerDiscreteScheduler
 from omegaconf import OmegaConf
 from PIL import Image
 from transformers import AutoTokenizer
+from transformers import Wav2Vec2Model, Wav2Vec2Processor
 
 current_file_path = os.path.abspath(__file__)
 project_roots = [os.path.dirname(current_file_path), os.path.dirname(os.path.dirname(current_file_path)), os.path.dirname(os.path.dirname(os.path.dirname(current_file_path)))]
@@ -22,7 +26,7 @@ from videox_fun.dist import set_multi_gpus_devices, shard_model
 from videox_fun.models import (AutoencoderKLWan, AutoTokenizer, CLIPModel,
                               WanT5EncoderModel, WanTransformer3DModel)
 from videox_fun.models.cache_utils import get_teacache_coefficients
-from videox_fun.pipeline import WanI2VPipeline
+from videox_fun.pipeline import WanAI2VPipeline, WanI2VPipeline
 from videox_fun.utils.fp8_optimization import (convert_model_weight_to_float8, replace_parameters_by_name,
                                               convert_weight_dtype_wrapper)
 from videox_fun.utils.lora_utils import merge_lora, unmerge_lora
@@ -30,21 +34,82 @@ from videox_fun.utils.utils import (filter_kwargs, get_image_to_video_latent,
                                    save_videos_grid)
 from videox_fun.utils.fm_solvers import FlowDPMSolverMultistepScheduler
 from videox_fun.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from ultimatevocalremover_api.src import models as demucs_models
+from ultimatevocalremover_api.src.utils.fastio import read as demucs_read_audio
 
-# GPU memory mode, which can be choosen in [model_full_load, model_full_load_and_qfloat8, model_cpu_offload, model_cpu_offload_and_qfloat8, sequential_cpu_offload].
-# model_full_load means that the entire model will be moved to the GPU.
-# 
-# model_full_load_and_qfloat8 means that the entire model will be moved to the GPU,
-# and the transformer model has been quantized to float8, which can save more GPU memory. 
-# 
-# model_cpu_offload means that the entire model will be moved to the CPU after use, which can save some GPU memory.
-# 
-# model_cpu_offload_and_qfloat8 indicates that the entire model will be moved to the CPU after use, 
-# and the transformer model has been quantized to float8, which can save more GPU memory. 
-# 
-# sequential_cpu_offload means that each layer of the model will be moved to the CPU after use, 
-# resulting in slower speeds but saving a large amount of GPU memory.
-# GPU_memory_mode     = "sequential_cpu_offload"
+def get_wav_vocal(
+    demucs_model,
+    wav_path,
+    demucsv4,
+    is_main_process,
+):
+    process_vocals_path = wav_path[:-4] + ("_demucs.wav" if not demucsv4 else "_demucsv4.wav")
+    if not os.path.exists(process_vocals_path) and is_main_process:
+        wav_path = str(wav_path)
+        # audio, sampling_rate = demucs_read_audio(wav_path)
+        # audio_duration = len(audio) / sampling_rate
+        # if audio_duration <= 8:
+        res = demucs_model(wav_path)
+        vocals = res["vocals"].cpu()
+        # else:
+        #     clip_len = 8 * sampling_rate
+        #     stride = 6 * sampling_rate
+        #     vocals = np.zeros_like(audio)
+        #     weights = np.zeros_like(audio)
+        #     for audio_clip_s in tqdm(range(0, len(audio), stride), desc="Preprocess Demucs for audio"):
+        #         audio_item = audio[audio_clip_s: audio_clip_s + clip_len]
+        #         demucs_model = copy.deepcopy(demucs_model_ori)
+        #         res = demucs_model(audio_item, sampling_rate)
+        #         vocal = res["vocals"].cpu()
+        #         end_idx = audio_clip_s + clip_len
+        #         vocals[audio_clip_s:end_idx] += vocal
+        #         weights[audio_clip_s:end_idx] += 1.0
+        #     weights = np.clip(weights, min=1e-8)
+        #     vocals /= weights
+        audiofile.write(process_vocals_path, vocals, demucs_model.sample_rate)
+    return process_vocals_path
+
+def get_audio_features(wav2vec, audio_processor, audio_path, fps, num_frames):
+    sr = 16000
+    audio_input, sample_rate = librosa.load(audio_path, sr=sr)  # 采样率为 16kHz
+
+    start_time = 0
+    # end_time = (0 + (num_frames - 1) * 1) / fps
+    end_time = num_frames / fps
+
+    start_sample = int(start_time * sr)
+    end_sample = int(end_time * sr)
+
+    try:
+        audio_segment = audio_input[start_sample:end_sample]
+    except:
+        audio_segment = audio_input
+
+    input_values = audio_processor(
+        audio_segment, sampling_rate=sample_rate, return_tensors="pt"
+    ).input_values.to("cuda")
+
+    with torch.no_grad():
+        fea = wav2vec(input_values).last_hidden_state
+
+    return fea, start_time, end_time
+
+def save_video_with_audio(save_path, save_path_tmp, audio_path, clip_st, clip_et):
+    # import pdb; pdb.set_trace()
+    audio_clip_path = save_path[:-4] + ".wav"
+    ffmpeg.input(audio_path, ss=clip_st, to=clip_et).audio.output(audio_clip_path).run(overwrite_output=True)
+    ffmpeg.output(
+        (ffmpeg.input(save_path_tmp)).video,
+        (ffmpeg.input(audio_clip_path)).audio,
+        save_path,
+        vcodec="copy",
+        acodec="aac",
+        shortest=None,
+        loglevel="error",
+    ).run(overwrite_output=True)
+    os.remove(save_path_tmp)
+    os.remove(audio_clip_path)
+
 GPU_memory_mode     = "no_cpu_offload"
 # Multi GPUs config
 # Please ensure that the product of ulysses_degree and ring_degree equals the number of GPUs used. 
@@ -84,37 +149,60 @@ import argparse
 if __name__ == "__main__":
     # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 
     #   /home/weili/miniconda3/envs/wan21_xc/bin/torchrun --nproc-per-node 4 --master-port 25083
-    #   examples/wan2.1/predict_i2v.py 
-    #   --validation_config config/wan2.1/i2v_1.3B_base_infer.yaml  
+    #   examples/wan2.1/predict_ai2v.py 
+    #   --validation_config default config/wan2.1/ai2v_1.3B_base_infer.yaml 
+    #   --infer_mode default ai2v
     #   --model_name default models/Wan2.1-Fun-1.3B-InP  
+    #   --wav2vec_model_dir default models/wav2vec2-base-960h
     #   --transformer_path default None
+    
     #   --save_dir_path default basename of validation_config
     #   --save_dir_path validations_outputs/xxx
     #   --save_parent default validations_outputs
-    #   --ulysses_degree 2
-    #   --ring_degree 2
+    
     #   --video_sample_size default 720 
     #   --video_length default 81 
-    #   --enable_teacache 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--validation_config", type=str, required=True)
-    parser.add_argument("--model_name", type=str, default="models/SkyReels-V2-I2V-1.3B-540P")
-    parser.add_argument("--transformer_path", type=str, default=None)
+    #   --demucsv4 
+    #   --process_audio_only 
     
+    #   --ulysses_degree 2
+    #   --ring_degree 2
+    #   --enable_teacache 
+    
+    #   --num_inference_steps
+    #   --sample_shift
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--validation_config", type=str, default="config/wan2.1/ai2v_1.3B_base_infer.yaml")
+    # model path, model architecture and infer mode
+    parser.add_argument("--infer_mode", type=str, default="ai2v",) # select ai2v or i2v
+    parser.add_argument("--model_name", type=str, default="models/Wan2.1-Fun-1.3B-InP")
+    parser.add_argument("--transformer_path", type=str, default=None)
+    parser.add_argument("--wav2vec_model_dir",type=str,default="models/wav2vec2-base-960h",)
+    parser.add_argument("--audio_in_dim", type=int, default=768, help="Audio Feature inner dim.")
+    parser.add_argument("--audio_proj_dim", type=int, default=768, help="Audio Feature projection dim.")
+    # save path related
     parser.add_argument("--save_parent", type=str, default="validations_outputs")
     parser.add_argument("--save_dir_path", type=str, default=None)
+    # data related
     parser.add_argument("--video_sample_size", type=int, default=720,)
     parser.add_argument("--video_length", type=int, default=81)
+    parser.add_argument("--demucsv4", action="store_true")
+    parser.add_argument("--process_audio_only", action="store_true")
+    parser.add_argument("--fps", type=int, default=25)
+    # Diffusion related
+    parser.add_argument("--num_inference_steps", type=int, default=50,)
+    parser.add_argument("--sample_shift", type=float, default=0,)
+    # Parallel related
     parser.add_argument("--ulysses_degree", type=int, default=1)
     parser.add_argument("--ring_degree", type=int, default=1)
     parser.add_argument("--enable_teacache", action="store_true")
-    parser.add_argument("--fps", type=int, default=25)
+    
     args = parser.parse_args()
     # Other params
     valid_config = OmegaConf.load(args.validation_config)
     if args.save_dir_path is None:
         args.save_dir_path = os.path.join(args.save_parent, os.path.basename(args.validation_config)[:-5])
-    video_length        = args.video_length
     fps                 = args.fps
     model_name          = args.model_name
     ulysses_degree      = args.ulysses_degree
@@ -142,7 +230,7 @@ if __name__ == "__main__":
 
     guidance_scale      = 6.0
     seed                = 43
-    num_inference_steps = 50
+    num_inference_steps = args.num_inference_steps
     lora_weight         = 0.55
 
     device = set_multi_gpus_devices(ulysses_degree, ring_degree)
@@ -157,6 +245,17 @@ if __name__ == "__main__":
         os.makedirs(args.save_dir_path, exist_ok=True)
     config = OmegaConf.load(config_path)
 
+    # demucs model
+    demucs_model = demucs_models.Demucs(
+        name="hdemucs_mmi" if not args.demucsv4 else "htdemucs_ft",
+        other_metadata={"segment": 2, "split": True},
+        device="cuda:0",
+        logger=None,
+    )
+
+    config["transformer_additional_kwargs"]["ai2v_enable"] = args.infer_mode == "ai2v"
+    config["transformer_additional_kwargs"]["audio_in_dim"] = args.audio_in_dim
+    config["transformer_additional_kwargs"]["audio_proj_dim"] = args.audio_proj_dim
     transformer = WanTransformer3DModel.from_pretrained(
         os.path.join(model_name, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
         transformer_additional_kwargs=OmegaConf.to_container(config['transformer_additional_kwargs']),
@@ -214,6 +313,11 @@ if __name__ == "__main__":
         os.path.join(model_name, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
     ).to(weight_dtype)
     clip_image_encoder = clip_image_encoder.eval()
+    
+    # Get Audio Processor
+    if args.infer_mode == "ai2v":
+        wav2vec_processor = Wav2Vec2Processor.from_pretrained(args.wav2vec_model_dir)
+        wav2vec = Wav2Vec2Model.from_pretrained(args.wav2vec_model_dir).cuda().eval()
 
     # Get Scheduler
     Choosen_Scheduler = scheduler_dict = {
@@ -222,19 +326,20 @@ if __name__ == "__main__":
         "Flow_DPM++": FlowDPMSolverMultistepScheduler,
     }[sampler_name]
     if sampler_name == "Flow_Unipc" or sampler_name == "Flow_DPM++":
-        config['scheduler_kwargs']['shift'] = 1
+        config['scheduler_kwargs']['shift'] = args.sample_shift
     scheduler = Choosen_Scheduler(
         **filter_kwargs(Choosen_Scheduler, OmegaConf.to_container(config['scheduler_kwargs']))
     )
 
     # Get Pipeline
-    pipeline = WanI2VPipeline(
+    PipelineClass = WanAI2VPipeline if args.infer_mode == "ai2v" else WanI2VPipeline
+    pipeline = PipelineClass(
         transformer=transformer,
         vae=vae,
         tokenizer=tokenizer,
         text_encoder=text_encoder,
         scheduler=scheduler,
-        clip_image_encoder=clip_image_encoder
+        clip_image_encoder=clip_image_encoder,
     )
     if ulysses_degree > 1 or ring_degree > 1:
         from functools import partial
@@ -268,12 +373,23 @@ if __name__ == "__main__":
     if lora_path is not None:
         pipeline = merge_lora(pipeline, lora_path, lora_weight, device=device)
 
-    for validation_image_start, validation_prompt, validation_neg_prompt in tqdm(valid_config.data.test_cases):
+    for (validation_image_start, 
+        validation_prompt, 
+        validation_neg_prompt,
+        validation_audio_path) in tqdm(valid_config.data.test_cases):
         basename = os.path.basename(validation_image_start)[:-4]
         save_path = os.path.join(args.save_dir_path, basename)
         if os.path.exists(save_path): continue
         with torch.no_grad():
-            video_length = int((video_length - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1 if video_length != 1 else 1
+            if args.infer_mode == "ai2v":
+                audio_vocal_path = get_wav_vocal(demucs_model, validation_audio_path, args.demucsv4, is_main_process)
+                if ulysses_degree > 1 or ring_degree > 1:
+                    dist.barrier()
+                audio_wav2vec_fea, start_time, end_time = get_audio_features(
+                    wav2vec, wav2vec_processor, audio_vocal_path, args.fps, args.video_length
+                )
+            if args.process_audio_only: continue
+            video_length = int((args.video_length - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1 if args.video_length != 1 else 1
             latent_frames = (video_length - 1) // vae.config.temporal_compression_ratio + 1
 
             if enable_riflex:
@@ -303,6 +419,7 @@ if __name__ == "__main__":
                 video      = input_video,
                 mask_video   = input_video_mask,
                 clip_image = clip_image,
+                audio_wav2vec_fea = audio_wav2vec_fea if args.infer_mode == "ai2v" else None,
                 cfg_skip_ratio = cfg_skip_ratio,
                 shift = shift,
             ).videos
@@ -318,8 +435,12 @@ if __name__ == "__main__":
                 image = Image.fromarray(image)
                 image.save(save_path)
             else:
+                save_path_tmp = save_path + ("_tmp.mp4" if args.infer_mode == "ai2v" else ".mp4")
                 save_path = save_path + ".mp4"
-                save_videos_grid(sample, save_path, fps=fps)
+                save_videos_grid(sample, save_path_tmp, fps=fps)
+                if args.infer_mode == "ai2v":
+                    save_video_with_audio(save_path, save_path_tmp, validation_audio_path, start_time, end_time)
+                
         if is_main_process:
             save_results()
         if ulysses_degree > 1 or ring_degree > 1:

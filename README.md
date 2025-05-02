@@ -8,14 +8,25 @@ pip install -r requirements.txt
 ```
 Place model under your workspace
 ```
-ln -s /mnt/weka/pretrained_weights/WanPretrainWeight/* models/*
+ln -s /mnt/weka/pretrained_weights/WanPretrainWeight/* models/
+ln -s /mnt/weka/pretrained_weights/wav2vec2-base-960h models/
 ```
+Install ultimatevocalremover_api
+```
+cp -r /mnt/weka/hw_workspace/sr_workspace/Data_Preprocess0312/face_datasets/ultimatevocalremover_api ./
+```
+After that, You need to modify "package = torch.load(path, 'cpu')" in 60 line of ultimatevocalremover_api/src/models_dir/demucs/demucs/states.py to "package = torch.load(path, 'cpu', weights_only=False)" manually for use demucs
 
 ## How to inference?
+### I2V
 Using USP for faster inference (720p, 81frames, 50 step in 36s).
 Remember to modify your save path, save_dir_path
 ```
 CUDA_VISIBLE_DEVICES=0,1,2,3 /home/weili/miniconda3/envs/wan21_xc/bin/torchrun --nproc-per-node 4 --master-port 25083 examples/wan2.1/predict_i2v.py --validation_config config/wan2.1/i2v_1.3B_base_infer.yaml --model_name models/SkyReels-V2-I2V-1.3B-540P --save_dir_path validations_outputs/xxx --ulysses_degree 2 --ring_degree 2
+```
+### AI2V
+```
+
 ```
 
 ## How to training?

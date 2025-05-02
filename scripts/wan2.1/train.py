@@ -32,6 +32,8 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 import torchvision.transforms.functional as TF
 import transformers
+import librosa
+import ffmpeg
 from accelerate import Accelerator, FullyShardedDataParallelPlugin
 from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
@@ -39,7 +41,6 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers import DDIMScheduler, FlowMatchEulerDiscreteScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import (EMAModel,
-                                      compute_density_for_timestep_sampling,
                                       compute_loss_weighting_for_sd3)
 from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.torch_utils import is_compiled_module
@@ -55,6 +56,7 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 from transformers.utils import ContextManagers
+from transformers import Wav2Vec2Model, Wav2Vec2Processor
 
 import datasets
 
@@ -89,6 +91,32 @@ def filter_kwargs(cls, kwargs):
     valid_params = set(sig.parameters.keys()) - {'self', 'cls'}
     filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
     return filtered_kwargs
+
+def compute_density_for_timestep_sampling(
+    weighting_scheme: str, 
+    batch_size: int, 
+    logit_mean: float = None, 
+    logit_std: float = None, 
+    mode_scale: float = None,
+    generator = None,
+):
+    """
+    Compute the density for sampling the timesteps when doing SD3 training.
+
+    Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
+
+    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+    """
+    if weighting_scheme == "logit_normal":
+        # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
+        u = torch.normal(mean=logit_mean, std=logit_std, size=(batch_size,), device="cuda", generator=generator)
+        u = torch.nn.functional.sigmoid(u)
+    elif weighting_scheme == "mode":
+        u = torch.rand(size=(batch_size,), device="cuda", generator=generator)
+        u = 1 - u - mode_scale * (torch.cos(math.pi * u / 2) ** 2 - 1 + u)
+    else:
+        u = torch.rand(size=(batch_size,), device="cuda", generator=generator)
+    return u
 
 def get_random_downsample_ratio(sample_size, image_ratio=[],
                                 all_choices=False, rng=None):
@@ -158,12 +186,64 @@ def resize_mask(mask, latent, process_first_frame_only=True):
         )
     return resized_mask
 
+def get_wav_vocal(
+    demucs_model,
+    wav_path,
+    demucsv4,
+    is_main_process,
+):
+    process_vocals_path = wav_path[:-4] + ("_demucs.wav" if not demucsv4 else "_demucsv4.wav")
+    assert os.path.exists(process_vocals_path), f"{process_vocals_path=} is not exists"
+    return process_vocals_path
+
+def save_video_with_audio(save_path, save_path_tmp, audio_path, clip_st, clip_et):
+    audio_clip_path = save_path[:-4] + ".wav"
+    ffmpeg.input(audio_path, ss=clip_st, to=clip_et).audio.output(audio_clip_path).run(overwrite_output=True)
+    ffmpeg.output(
+        (ffmpeg.input(save_path_tmp)).video,
+        (ffmpeg.input(audio_clip_path)).audio,
+        save_path,
+        vcodec="copy",
+        acodec="aac",
+        shortest=None,
+        loglevel="error",
+    ).run(overwrite_output=True)
+    os.remove(save_path_tmp)
+    os.remove(audio_clip_path)
+
+def get_audio_features(wav2vec, audio_processor, audio_path, fps, num_frames):
+    sr = 16000
+    audio_input, sample_rate = librosa.load(audio_path, sr=sr)  # 采样率为 16kHz
+
+    start_time = 0
+    # end_time = (0 + (num_frames - 1) * 1) / fps
+    end_time = num_frames / fps
+
+    start_sample = int(start_time * sr)
+    end_sample = int(end_time * sr)
+
+    try:
+        audio_segment = audio_input[start_sample:end_sample]
+    except:
+        audio_segment = audio_input
+
+    input_values = audio_processor(
+        audio_segment, sampling_rate=sample_rate, return_tensors="pt"
+    ).input_values.to("cuda")
+
+    with torch.no_grad():
+        fea = wav2vec(input_values).last_hidden_state
+
+    return fea, start_time, end_time
+
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.18.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
-def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer3d, args, config, accelerator, weight_dtype, global_step):
+def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer3d, 
+                   wav2vec_processor, wav2vec, 
+                   args, config, accelerator, weight_dtype, global_step):
     try:
         logger.info("Running validation... ")
             
@@ -203,6 +283,12 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
         images = []
         for i in range(len(args.validation_prompts)):
             with torch.no_grad():
+                if args.train_mode == "ai2v":
+                    validation_audio_path = args.validation_audio_paths[i]
+                    audio_vocal_path = get_wav_vocal(None, validation_audio_path, args.demucsv4, True)
+                    audio_wav2vec_fea, start_time, end_time = get_audio_features(
+                        wav2vec, wav2vec_processor, audio_vocal_path, 25, args.video_sample_n_frames
+                    )
                 if args.train_mode != "normal":
                     with torch.autocast("cuda", dtype=weight_dtype):
                         video_length = int((args.video_sample_n_frames - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1 if args.video_sample_n_frames != 1 else 1
@@ -233,9 +319,14 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                             video        = input_video,
                             mask_video   = input_video_mask,
                             clip_image   = clip_image,
+                            audio_wav2vec_fea = audio_wav2vec_fea if args.train_mode == "ai2v" else None,
                         ).videos
                         os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
-                        save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-{i}-{basename}.mp4"))
+                        save_path = os.path.join(args.output_dir, f"sample/sample-{global_step}-{i}-{basename}.mp4")
+                        save_path_tmp = save_path[:-4] + ("_tmp.mp4" if args.infer_mode == "ai2v" else ".mp4")
+                        save_videos_grid(sample, save_path_tmp)
+                        if args.infer_mode == "ai2v":
+                            save_video_with_audio(save_path, save_path_tmp, validation_audio_path, start_time, end_time)
 
                         video_length = 1
                         input_video, input_video_mask, clip_image = get_image_to_video_latent(args.validation_image_starts[i], None, video_length=video_length, sample_size=resize_size, center_crop_size=closest_size)
@@ -320,6 +411,13 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--wav2vec_model_dir",
+        type=str,
+        default="models/wav2vec2-base-960h",
+        help="Path to audio wav2vec2 from huggingface.co/models.",
+    )
+    parser.add_argument("--demucsv4", action="store_true")
+    parser.add_argument(
         "--revision",
         type=str,
         default=None,
@@ -379,6 +477,13 @@ def parse_args():
         help=("A set of images path evaluated every `--validation_epochs` and logged to `--report_to`."),
     )
     parser.add_argument(
+        "--validation_audio_paths",
+        type=str,
+        default=None,
+        nargs="+",
+        help=("A set of images path evaluated every `--validation_epochs` and logged to `--report_to`."),
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="sd-model-finetuned",
@@ -429,6 +534,12 @@ def parse_args():
         "--gradient_checkpointing",
         action="store_true",
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing_rate",
+        type=float,
+        default=1,
+        help="gradient_checkpointing enable rate",
     )
     parser.add_argument(
         "--learning_rate",
@@ -588,6 +699,9 @@ def parse_args():
     )
     parser.add_argument(
         "--uniform_sampling", action="store_true", help="Whether or not to use uniform_sampling."
+    )
+    parser.add_argument(
+        "--continuous_sampling", action="store_true", help="When training continuous samples, if it is set, uniform_sampling will be of no use"
     )
     parser.add_argument(
         "--enable_text_encoder_in_dataloader", action="store_true", help="Whether or not to use text encoder in dataloader."
@@ -751,7 +865,13 @@ def parse_args():
         default=1.29,
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
     )
-
+    parser.add_argument(
+        "--audio_in_dim", type=int, default=768, help="Audio Feature inner dim."
+    )
+    parser.add_argument(
+        "--audio_proj_dim", type=int, default=768, help="Audio Feature projection dim."
+    )
+    
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -765,26 +885,29 @@ def parse_args():
 
 
 def main():
-    # CUDA_VISIBLE_DEVICES=0,1,2,3 /home/weili/miniconda3/envs/wan21_xc/bin/accelerate \
-    #     launch --num_processes 4 \
+    # CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 
+    #     /home/weili/miniconda3/envs/wan21_xc/bin/accelerate \
+    #     launch --num_processes 4 --main_process_port 28964 \
     #     scripts/wan2.1/train.py \
+    #     --train_mode default i2v, could select ai2v or normal(t2v) \
     #     --config_path config/wan2.1/sky_i2v_1.3B.yaml \
     #     --enable_bucket \
     #     --uniform_sampling \
+    #     --continuous_sampling \
     #     --trainable_modules "." \
     #     --preprocess_text_embed asset/xc_half_body_talkEasyPrompt.pt \
-    #     --train_batch_size 2 
     #     --output_dir output_dir/xxx \
-    #     --gradient_checkpointing
+    #     --train_batch_size 1 default 1
+    #     --gradient_checkpointing 
+    #     --gradient_checkpointing_rate 0.5 default 1
+    #     --gradient_accumulation_steps 4 default 1 \
+    #     --resume_from_checkpoint latest default None
     #     Bellow is default --------------------------------------------------------
-    #     --train_mode default i2v \
     #     --pretrained_model_name_or_path default models/SkyReels-V2-I2V-1.3B-540P \
     #     --image_sample_size default 1024 \
     #     --video_sample_size default 720 \
     #     --video_sample_n_frames default 81 \
-    #     --train_batch_size default 1 \
     #     --video_repeat default 1 \
-    #     --gradient_accumulation_steps default 1 \
     #     --dataloader_num_workers default 8 \
     #     --num_train_epochs default 1000 \
     #     --checkpointing_steps default 1000 \
@@ -798,6 +921,8 @@ def main():
     #     --adam_epsilon default 1e-10 \
     #     --vae_mini_batch default 2 \
     #     --max_grad_norm default 0.05
+    #     --audio_in_dim default 768
+    #     --audio_proj_dim default 768
     args = parse_args()
 
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -818,14 +943,29 @@ def main():
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
     config = OmegaConf.load(args.config_path)
-    args.validation_prompts = []
-    args.validation_neg_prompts = []
-    args.validation_image_starts = []
-    for validation_image_start, validation_prompt, validation_neg_prompt in config.data.test_cases:
-        args.validation_prompts.append(validation_prompt)
-        args.validation_neg_prompts.append(validation_neg_prompt)
-        args.validation_image_starts.append(validation_image_start)
-    
+    if args.train_mode == "ai2v":
+        args.validation_prompts = []
+        args.validation_neg_prompts = []
+        args.validation_image_starts = []
+        args.validation_audio_paths = []
+        for (validation_image_start, 
+            validation_prompt, 
+            validation_neg_prompt,
+            validation_audio_path) in config.data.test_cases:
+            args.validation_prompts.append(validation_prompt)
+            args.validation_neg_prompts.append(validation_neg_prompt)
+            args.validation_image_starts.append(validation_image_start)
+            args.validation_audio_paths.append(validation_audio_path)
+    elif args.train_mode != "normal":
+        args.validation_prompts = []
+        args.validation_neg_prompts = []
+        args.validation_image_starts = []
+        for (validation_image_start, 
+            validation_prompt, 
+            validation_neg_prompt) in config.data.test_cases:
+            args.validation_prompts.append(validation_prompt)
+            args.validation_neg_prompts.append(validation_neg_prompt)
+            args.validation_image_starts.append(validation_image_start)
     
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
@@ -932,7 +1072,11 @@ def main():
             os.path.join(args.pretrained_model_name_or_path, config['vae_kwargs'].get('vae_subpath', 'vae')),
             additional_kwargs=OmegaConf.to_container(config['vae_kwargs']),
         )
-            
+    
+    config["transformer_additional_kwargs"]["gradient_checkpointing_rate"] = args.gradient_checkpointing_rate
+    config["transformer_additional_kwargs"]["ai2v_enable"] = args.train_mode == "ai2v"
+    config["transformer_additional_kwargs"]["audio_in_dim"] = args.audio_in_dim
+    config["transformer_additional_kwargs"]["audio_proj_dim"] = args.audio_proj_dim
     # Get Transformer
     transformer3d = WanTransformer3DModel.from_pretrained(
         os.path.join(args.pretrained_model_name_or_path, config['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
@@ -945,6 +1089,10 @@ def main():
             os.path.join(args.pretrained_model_name_or_path, config['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
         )
         clip_image_encoder = clip_image_encoder.eval()
+        
+    if args.train_mode == "ai2v":
+        wav2vec_processor = Wav2Vec2Processor.from_pretrained(args.wav2vec_model_dir)
+        wav2vec = Wav2Vec2Model.from_pretrained(args.wav2vec_model_dir).eval()        
 
     # Freeze vae and text_encoder and set transformer3d to trainable
     vae.requires_grad_(False)
@@ -952,6 +1100,8 @@ def main():
     transformer3d.requires_grad_(False)
     if args.train_mode != "normal":
         clip_image_encoder.requires_grad_(False)
+    if args.train_mode == "ai2v":
+        wav2vec.requires_grad_(False)
 
     if args.transformer_path is not None:
         print(f"From checkpoint: {args.transformer_path}")
@@ -1169,6 +1319,7 @@ def main():
         cfg=config,
         split='train',
         enable_bucket=args.enable_bucket,
+        wav2vec_processor=wav2vec_processor if args.train_mode == "ai2v" else None,
         resume_step=0,
     )
     
@@ -1217,6 +1368,8 @@ def main():
                 new_examples["mask_pixel_values"] = []
                 new_examples["mask"] = []
                 new_examples["clip_pixel_values"] = []
+            if args.train_mode == "ai2v":
+                new_examples["audio_feature"] = []
 
             # Get downsample ratio in image and videos
             pixel_value     = examples[0]["pixel_values"]
@@ -1333,6 +1486,8 @@ def main():
                     clip_pixel_values = new_examples["pixel_values"][-1][0].permute(1, 2, 0).contiguous()
                     clip_pixel_values = (clip_pixel_values * 0.5 + 0.5) * 255
                     new_examples["clip_pixel_values"].append(clip_pixel_values)
+                if args.train_mode == "ai2v":
+                    new_examples["audio_feature"].append(example["audio_feature"])
 
             # Limit the number of frames to the same
             new_examples["pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["pixel_values"]])
@@ -1341,7 +1496,9 @@ def main():
                 new_examples["mask_pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["mask_pixel_values"]])
                 new_examples["mask"] = torch.stack([example[:batch_video_length] for example in new_examples["mask"]])
                 new_examples["clip_pixel_values"] = torch.stack([example for example in new_examples["clip_pixel_values"]])
-
+            if args.train_mode == "ai2v":
+                new_examples["audio_feature"] = torch.stack([example for example in new_examples["audio_feature"]])
+            
             # Encode prompts when enable_text_encoder_in_dataloader=True
             if args.enable_text_encoder_in_dataloader:
                 prompt_ids = tokenizer(
@@ -1413,6 +1570,8 @@ def main():
         
     if args.train_mode != "normal":
         clip_image_encoder.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
+    if args.train_mode == "ai2v":
+        wav2vec.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1428,6 +1587,7 @@ def main():
         tracker_config.pop("validation_prompts")
         tracker_config.pop("validation_neg_prompts")
         tracker_config.pop("validation_image_starts")
+        tracker_config.pop("validation_audio_paths")
         tracker_config.pop("preprocess_text_embed")
         tracker_config.pop("trainable_modules")
         tracker_config.pop("trainable_modules_low_learning_rate")
@@ -1563,6 +1723,8 @@ def main():
                             clip_pixel_values = torch.tile(clip_pixel_values, (2, 1, 1, 1))
                             mask_pixel_values = torch.tile(mask_pixel_values, (2, 1, 1, 1, 1))
                             mask = torch.tile(mask, (2, 1, 1, 1, 1))
+                if args.train_mode == "ai2v":
+                    audio_wav2vec_fea = batch["audio_feature"].to(weight_dtype)
 
                 if args.random_frame_crop:
                     def _create_special_list(length):
@@ -1635,6 +1797,8 @@ def main():
                     vae.to(accelerator.device)
                     if args.train_mode != "normal":
                         clip_image_encoder.to(accelerator.device)
+                    if args.train_mode == "ai2v":
+                        wav2vec.to(accelerator.device)
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to("cpu")
 
@@ -1684,6 +1848,10 @@ def main():
                             _clip_context = clip_image_encoder([clip_image[:, None, :, :]])
                             clip_context.append(_clip_context)
                         clip_context = torch.cat(clip_context)
+                    if args.train_mode == "ai2v":
+                        audio_wav2vec_fea = wav2vec(audio_wav2vec_fea).last_hidden_state
+                        audio_scale_tensor = (torch.rand((audio_wav2vec_fea.size(0), ), device=accelerator.device, generator=torch_rng) >= 0.1).to(audio_wav2vec_fea)
+                        
                                                 
                 # wait for latents = vae.encode(pixel_values) to complete
                 if vae_stream_1 is not None:
@@ -1693,6 +1861,8 @@ def main():
                     vae.to('cpu')
                     if args.train_mode != "normal":
                         clip_image_encoder.to('cpu')
+                    if args.train_mode == "ai2v":
+                        wav2vec.to('cpu')
                     torch.cuda.empty_cache()
                     if not args.enable_text_encoder_in_dataloader:
                         text_encoder.to(accelerator.device)
@@ -1725,39 +1895,54 @@ def main():
                 bsz, channel, num_frames, height, width = latents.size()
                 noise = torch.randn(latents.size(), device=latents.device, generator=torch_rng, dtype=weight_dtype)
 
-                if not args.uniform_sampling:
-                    u = compute_density_for_timestep_sampling(
+                if not args.continuous_sampling:
+                    if not args.uniform_sampling:
+                        u = compute_density_for_timestep_sampling(
+                            weighting_scheme=args.weighting_scheme,
+                            batch_size=bsz,
+                            logit_mean=args.logit_mean,
+                            logit_std=args.logit_std,
+                            mode_scale=args.mode_scale,
+                            generator=torch_rng,
+                        )
+                        indices = (u * noise_scheduler.config.num_train_timesteps).long()
+                    else:
+                        # Sample a random timestep for each image
+                        # timesteps = generate_timestep_with_lognorm(0, args.train_sampling_steps, (bsz,), device=latents.device, generator=torch_rng)
+                        # timesteps = torch.randint(0, args.train_sampling_steps, (bsz,), device=latents.device, generator=torch_rng)
+                        indices = idx_sampling(bsz, generator=torch_rng, device=latents.device)
+                        indices = indices.long().cpu()
+                    timesteps = noise_scheduler.timesteps[indices].to(device=latents.device)
+
+                    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+                        sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
+                        schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
+                        timesteps = timesteps.to(accelerator.device)
+                        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+                        sigma = sigmas[step_indices].flatten()
+                        while len(sigma.shape) < n_dim:
+                            sigma = sigma.unsqueeze(-1)
+                        return sigma
+
+                    # Add noise according to flow matching.
+                    # zt = (1 - texp) * x + texp * z1
+                    sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
+                else:
+                    sigmas = compute_density_for_timestep_sampling(
                         weighting_scheme=args.weighting_scheme,
                         batch_size=bsz,
                         logit_mean=args.logit_mean,
                         logit_std=args.logit_std,
                         mode_scale=args.mode_scale,
+                        generator=torch_rng,
                     )
-                    indices = (u * noise_scheduler.config.num_train_timesteps).long()
-                else:
-                    # Sample a random timestep for each image
-                    # timesteps = generate_timestep_with_lognorm(0, args.train_sampling_steps, (bsz,), device=latents.device, generator=torch_rng)
-                    # timesteps = torch.randint(0, args.train_sampling_steps, (bsz,), device=latents.device, generator=torch_rng)
-                    indices = idx_sampling(bsz, generator=torch_rng, device=latents.device)
-                    indices = indices.long().cpu()
-                timesteps = noise_scheduler.timesteps[indices].to(device=latents.device)
-
-                def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
-                    sigmas = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
-                    schedule_timesteps = noise_scheduler.timesteps.to(accelerator.device)
-                    timesteps = timesteps.to(accelerator.device)
-                    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
-
-                    sigma = sigmas[step_indices].flatten()
-                    while len(sigma.shape) < n_dim:
-                        sigma = sigma.unsqueeze(-1)
-                    return sigma
-
-                # Add noise according to flow matching.
-                # zt = (1 - texp) * x + texp * z1
-                sigmas = get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
+                    sigmas = sigmas.to(latents)
+                    timesteps = sigmas * noise_scheduler.config.num_train_timesteps
+                    while len(sigmas.shape) < len(latents.shape):
+                        sigmas = sigmas.unsqueeze(-1)
+                
                 noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
-
                 # Add noise
                 target = noise - latents
                 
@@ -1777,6 +1962,8 @@ def main():
                         seq_len=seq_len,
                         y=inpaint_latents if args.train_mode != "normal" else None,
                         clip_fea=clip_context if args.train_mode != "normal" else None,
+                        audio_fea=audio_wav2vec_fea if args.train_mode == "ai2v" else None,
+                        audio_scale=audio_scale_tensor if args.train_mode == "ai2v" else None
                     )
                 
                 def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):
@@ -1885,6 +2072,8 @@ def main():
                             tokenizer,
                             clip_image_encoder,
                             transformer3d,
+                            wav2vec_processor if args.train_mode == "ai2v" else None, 
+                            wav2vec if args.train_mode == "ai2v" else None, 
                             args,
                             config,
                             accelerator,
@@ -1913,6 +2102,8 @@ def main():
                     tokenizer,
                     clip_image_encoder,
                     transformer3d,
+                    wav2vec_processor if args.train_mode == "ai2v" else None, 
+                    wav2vec if args.train_mode == "ai2v" else None, 
                     args,
                     config,
                     accelerator,

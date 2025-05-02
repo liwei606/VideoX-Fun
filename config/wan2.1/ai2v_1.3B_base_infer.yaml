@@ -1,0 +1,207 @@
+format: civitai
+pipeline: Wan
+transformer_additional_kwargs:
+  transformer_subpath: ./
+  dict_mapping:
+    in_dim: in_channels
+    dim: hidden_size
+
+vae_kwargs:
+  vae_subpath: Wan2.1_VAE.pth
+  temporal_compression_ratio: 4
+  spatial_compression_ratio: 8
+
+text_encoder_kwargs:
+  text_encoder_subpath: models_t5_umt5-xxl-enc-bf16.pth
+  tokenizer_subpath: google/umt5-xxl
+  text_length: 512
+  vocab: 256384
+  dim: 4096
+  dim_attn: 4096
+  dim_ffn: 10240
+  num_heads: 64
+  num_layers: 24
+  num_buckets: 32
+  shared_pos: False
+  dropout: 0.0
+
+scheduler_kwargs:
+  scheduler_subpath: null
+  num_train_timesteps: 1000
+  shift: 5.0
+  use_dynamic_shifting: false
+  base_shift: 0.5
+  max_shift: 1.15
+  base_image_seq_len: 256
+  max_image_seq_len: 4096
+
+image_encoder_kwargs:
+  image_encoder_subpath: models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth
+
+data:
+  n_sample_frames: 77 # pick [n_sample_frames] frames from 90 frames
+  past_n: 4 # pick [past_n] frames from 10 frames
+  train_width: auto 
+  train_height: auto 
+  train_fps: 25
+  
+  union_bbox_scale: [1.2, 1.4]
+  mouth_bbox_scale: 1.5 # mouth bounding box scale for mediapipe's detection
+  eye_bbox_scale: 2.0 # eye bounding box scale for mediapipe's detection
+  
+  past_frame_is_ref: False
+  get_double_sample: False
+
+  vx_ratio_crop: -0.20
+  vy_ratio_crop: 0
+  driving_video_scale: 1.2
+  body_score_thresh: 3
+  body_level: 3
+  flip_aug: true
+  pose_max: [45, 40, 30]
+  pose_delta: [40, 25, 20]
+  lip_open_ratio: 0.0
+  hyperIQA_min: 30
+
+  cache_file_path: 
+    - [/home/weili/RealTimeV3Cache/20250429/394w_0w_20w_strongStaticBack_WeakSyncNet_body3_13k_IQA30_x3, 1, video]
+    - [/home/weili/RealTimeV3Cache/20250429/394w_20w_40w_strongStaticBack_WeakSyncNet_body3_13k_IQA30_x3, 1, video]
+    - [/home/weili/RealTimeV3Cache/20250429/394w_40w_60w_strongStaticBack_WeakSyncNet_body3_13k_IQA30_x3, 1, video]
+    - [/home/weili/RealTimeV3Cache/20250429/video_dit_183k_strongStaticBack_WeakSyncNet_body3_13k_IQA30_x3, 1, video]
+
+  test_cases:
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select20250413/flux1_20250413_clear_face_face_5.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/Gun_advertisement_brief_man.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select20250413/flux1_20250413_clear_face_face_7.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/Gun_advertisement_brief_man.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select20250413/flux1_20250413_clear_face_face_8.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/Gun_advertisement_brief_man.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select20250413/flux1_20250413_clear_face_face_14.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/Democracy_man.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select20250413/flux1_20250413_clear_face_face_28.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/Democracy_man.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select20250413/flux1_20250413_clear_face_face_29.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/Democracy_man.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select20250413/flux1_20250413_unclear_face_face_2.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/apple_woman.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select20250413/flux1_20250413_unclear_face_face_6.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/apple_woman.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/already_ai2v_img/hand_gestures.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/apple_woman.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/already_ai2v_img/hand_gestures(1).jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/apple_woman.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/already_ai2v_img/hand_gestures(2).jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/battle_fail_man.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/already_ai2v_img/lip-sync_portrait.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/battle_fail_man.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/already_ai2v_img/lip-sync_portrait(1).jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/battle_fail_man.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/already_ai2v_img/long_video_generation.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/battle_fail_man.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/already_ai2v_img/singing_lip_sync.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/supermarket_woman.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/already_ai2v_img/singing_lip_sync(1).jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/supermarket_woman.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/already_ai2v_img/talking_pets.jpg, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/supermarket_woman.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/RealHalf_bench0428/real_half_body_man1.png, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/supermarket_woman.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/RealHalf_bench0428/real_half_body_man2.png, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/jar_of_love.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/RealHalf_bench0428/real_half_body_man3.png, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/jar_of_love.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/RealHalf_bench0428/real_half_body_man4.png, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/jar_of_love.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/RealHalf_bench0428/real_half_body_woman1.png, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/super_idol.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/RealHalf_bench0428/real_half_body_woman2.png, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/super_idol.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/RealHalf_bench0428/real_half_body_woman3.png, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/super_idol.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/RealHalf_bench0428/real_half_body_woman4.png, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/neige.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/RealHalf_bench0428/real_half_body_woman5.png, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/neige.wav,
+    ]
+    - [/mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/RealHalf_bench0428/real_half_body_woman6.png, 
+      "A person is speaking.",
+      "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward",
+      /mnt/weka/hw_workspace/sr_workspace/benchmark/Big_model_benchmark/xc_select_audio/neige.wav,
+    ]

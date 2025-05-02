@@ -385,8 +385,12 @@ class XCImageVideoSampler(AspectRatioBatchImageVideoSampler):
         for idx in self.sampler:
             folder, content_type = self.dataset[idx]
             try:
+                pixel_values_dir = os.path.join(folder, "pixel_values")
                 with open(os.path.join(folder, "meta_result.pkl"), 'rb') as f:
-                    meta_result = pickle.load(f) 
+                    meta_result = pickle.load(f)
+                clip_target_idx = meta_result["clip_target_idx"].tolist()
+                assert (clip_target_idx[-1] - clip_target_idx[0] + 1) == len(os.listdir(pixel_values_dir)), \
+                    f"clip_target_idx is not matching with video length {(clip_target_idx[-1] - clip_target_idx[0] + 1)=} {len(os.listdir(pixel_values_dir))=}"
                 width, height = meta_result["width"], meta_result["height"]
                 ratio = height / width
             except Exception as e:

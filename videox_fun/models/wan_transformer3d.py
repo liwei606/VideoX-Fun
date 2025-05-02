@@ -543,11 +543,209 @@ class WanI2VCrossAttention(WanSelfAttention):
         x = self.o(x)
         return x
 
+class WanAI2VCrossAttention(WanI2VCrossAttention):
+    def __init__(self,
+                 dim,
+                 context_dim,
+                 num_heads,
+                 window_size=(-1, -1),
+                 qk_norm=True,
+                 eps=1e-6):
+        super().__init__(dim, num_heads, window_size, qk_norm, eps)
+
+
+        self.k_audio_proj = nn.Linear(context_dim, dim, bias=False)
+        self.v_audio_proj = nn.Linear(context_dim, dim, bias=False)
+
+        nn.init.zeros_(self.k_audio_proj.weight)
+        nn.init.zeros_(self.v_audio_proj.weight)
+
+    def __call__(
+        self,
+        x,
+        context,
+        context_lens,
+        dtype,
+        audio_proj: torch.Tensor,
+        audio_context_lens: torch.Tensor,
+        latents_num_frames: int = 21,
+        audio_scale: float = 1.0,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            x(Tensor): Shape [B, L1, C]
+            context(Tensor): Shape [B, L2, C]
+            context_lens(Tensor): Shape [B]
+            audio_proj:   [B, 21, L3, C]
+            audio_context_lens: [B*21].
+        """
+        context_img = context[:, :257]
+        context = context[:, 257:]
+        b, n, d = x.size(0), self.num_heads, self.head_dim
+
+        # compute query, key, value
+        q = self.norm_q(self.q(x.to(dtype))).view(b, -1, n, d)
+        k = self.norm_k(self.k(context.to(dtype))).view(b, -1, n, d)
+        v = self.v(context.to(dtype)).view(b, -1, n, d)
+        k_img = self.norm_k_img(self.k_img(context_img.to(dtype))).view(b, -1, n, d)
+        v_img = self.v_img(context_img.to(dtype)).view(b, -1, n, d)
+
+        img_x = attention(
+            q.to(dtype), 
+            k_img.to(dtype), 
+            v_img.to(dtype), 
+            k_lens=None
+        )
+        img_x = img_x.to(dtype)
+        # compute attention
+        x = attention(
+            q.to(dtype), 
+            k.to(dtype), 
+            v.to(dtype), 
+            k_lens=context_lens
+        )
+        x = x.to(dtype)
+
+        if len(audio_proj.shape) == 4:
+            audio_q = q.view(b * latents_num_frames, -1, n, d)  # [b, 21, l1, n, d]
+            ip_key = self.k_audio_proj(audio_proj).view(b * latents_num_frames, -1, n, d)
+            ip_value = self.v_audio_proj(audio_proj).view(b * latents_num_frames, -1, n, d)
+            audio_x = attention(
+                audio_q, 
+                ip_key, 
+                ip_value, 
+                k_lens=None
+            )
+            audio_x = audio_x.view(b, q.size(1), n, d)
+            audio_x = audio_x.flatten(2)
+        elif len(audio_proj.shape) == 3:
+            ip_key = self.k_audio_proj(audio_proj).view(b, -1, n, d)
+            ip_value = self.v_audio_proj(audio_proj).view(b, -1, n, d)
+            audio_x = attention(
+                q, 
+                ip_key, 
+                ip_value, 
+                k_lens=None
+            )
+            audio_x = audio_x.flatten(2)
+        
+        # output
+        x = x.flatten(2)
+        img_x = img_x.flatten(2)
+        x = x + img_x + audio_x * audio_scale[:, None, None]
+        x = self.o(x)
+        return x
 
 WAN_CROSSATTENTION_CLASSES = {
     't2v_cross_attn': WanT2VCrossAttention,
     'i2v_cross_attn': WanI2VCrossAttention,
+    "ai2v_cross_attn": WanAI2VCrossAttention,
 }
+
+class AudioProjModel(nn.Module):
+    def __init__(self, audio_in_dim=768, cross_attention_dim=768):
+        super().__init__()
+        self.cross_attention_dim = cross_attention_dim
+        self.proj = torch.nn.Linear(audio_in_dim, cross_attention_dim, bias=False)
+        self.norm = torch.nn.LayerNorm(cross_attention_dim)
+
+    def forward(self, audio_embeds):
+        context_tokens = self.proj(audio_embeds)
+        context_tokens = self.norm(context_tokens)
+        return context_tokens  # [B,L,C]
+
+def split_audio_sequence(audio_proj_length, num_frames=81):
+    """
+    Map the audio feature sequence to corresponding latent frame slices.
+
+    Args:
+        audio_proj_length (int): The total length of the audio feature sequence
+                                (e.g., 173 in audio_proj[1, 173, 768]).
+        num_frames (int): The number of video frames in the training data (default: 81).
+
+    Returns:
+        list: A list of [start_idx, end_idx] pairs. Each pair represents the index range
+            (within the audio feature sequence) corresponding to a latent frame.
+    """
+    # Average number of tokens per original video frame
+    tokens_per_frame = audio_proj_length / num_frames
+
+    # Each latent frame covers 4 video frames, and we want the center
+    tokens_per_latent_frame = tokens_per_frame * 4
+    half_tokens = int(tokens_per_latent_frame / 2)
+
+    pos_indices = []
+    for i in range(int((num_frames - 1) / 4) + 1):
+        if i == 0:
+            pos_indices.append(0)
+        else:
+            start_token = tokens_per_frame * ((i - 1) * 4 + 1)
+            end_token = tokens_per_frame * (i * 4 + 1)
+            center_token = int((start_token + end_token) / 2) - 1
+            pos_indices.append(center_token)
+
+    # Build index ranges centered around each position
+    pos_idx_ranges = [[idx - half_tokens, idx + half_tokens] for idx in pos_indices]
+
+    # Adjust the first range to avoid negative start index
+    pos_idx_ranges[0] = [
+        -(half_tokens * 2 - pos_idx_ranges[1][0]),
+        pos_idx_ranges[1][0],
+    ]
+
+    return pos_idx_ranges
+
+def split_tensor_with_padding(input_tensor, pos_idx_ranges, expand_length=0):
+    """
+    Split the input tensor into subsequences based on index ranges, and apply right-side zero-padding
+    if the range exceeds the input boundaries.
+
+    Args:
+        input_tensor (Tensor): Input audio tensor of shape [1, L, 768].
+        pos_idx_ranges (list): A list of index ranges, e.g. [[-7, 1], [1, 9], ..., [165, 173]].
+        expand_length (int): Number of tokens to expand on both sides of each subsequence.
+
+    Returns:
+        sub_sequences (Tensor): A tensor of shape [1, F, L, 768], where L is the length after padding.
+                                Each element is a padded subsequence.
+        k_lens (Tensor): A tensor of shape [F], representing the actual (unpadded) length of each subsequence.
+                        Useful for ignoring padding tokens in attention masks.
+    """
+    pos_idx_ranges = [
+        [idx[0] - expand_length, idx[1] + expand_length] for idx in pos_idx_ranges
+    ]
+    sub_sequences = []
+    seq_len = input_tensor.size(1)  # 173
+    max_valid_idx = seq_len - 1  # 172
+    k_lens_list = []
+    for start, end in pos_idx_ranges:
+        # Calculate the fill amount
+        pad_front = max(-start, 0)
+        pad_back = max(end - max_valid_idx, 0)
+
+        # Calculate the start and end indices of the valid part
+        valid_start = max(start, 0)
+        valid_end = min(end, max_valid_idx)
+
+        # Extract the valid part
+        if valid_start <= valid_end:
+            valid_part = input_tensor[:, valid_start : valid_end + 1, :]
+        else:
+            valid_part = input_tensor.new_zeros((1, 0, input_tensor.size(2)))
+
+        # In the sequence dimension (the 1st dimension) perform padding
+        padded_subseq = torch.nn.functional.pad(
+            valid_part,
+            (0, 0, 0, pad_back + pad_front, 0, 0),
+            mode="constant",
+            value=0,
+        )
+        k_lens_list.append(padded_subseq.size(-2) - pad_back - pad_front)
+
+        sub_sequences.append(padded_subseq)
+    return torch.stack(sub_sequences, dim=1), torch.tensor(
+        k_lens_list, dtype=torch.long
+    )
 
 
 class WanAttentionBlock(nn.Module):
@@ -555,6 +753,7 @@ class WanAttentionBlock(nn.Module):
     def __init__(self,
                  cross_attn_type,
                  dim,
+                 audio_context_dim,
                  ffn_dim,
                  num_heads,
                  window_size=(-1, -1),
@@ -569,6 +768,7 @@ class WanAttentionBlock(nn.Module):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.ai2v_enable = (cross_attn_type == "ai2v_cross_attn")
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
@@ -577,11 +777,19 @@ class WanAttentionBlock(nn.Module):
         self.norm3 = WanLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
-        self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim,
-                                                                      num_heads,
-                                                                      (-1, -1),
-                                                                      qk_norm,
-                                                                      eps)
+        if cross_attn_type in ["ai2v_cross_attn"]:
+            self.cross_attn = WanAI2VCrossAttention(dim,
+                                                    audio_context_dim,
+                                                    num_heads,
+                                                    (-1, -1),
+                                                    qk_norm,
+                                                    eps)
+        else:
+            self.cross_attn = WAN_CROSSATTENTION_CLASSES[cross_attn_type](dim,
+                                                                        num_heads,
+                                                                        (-1, -1),
+                                                                        qk_norm,
+                                                                        eps)
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
@@ -599,7 +807,11 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
-        dtype=torch.float32
+        dtype=torch.float32,
+        audio_proj=None,
+        audio_context_lens=None,
+        video_length=None,
+        audio_scale=None,
     ):
         r"""
         Args:
@@ -621,8 +833,11 @@ class WanAttentionBlock(nn.Module):
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             # cross-attention
-            x = x + self.cross_attn(self.norm3(x), context, context_lens, dtype)
-
+            if self.ai2v_enable:
+                x = x + self.cross_attn(self.norm3(x), context, context_lens, dtype, 
+                            audio_proj, audio_context_lens, video_length, audio_scale,)
+            else:
+                x = x + self.cross_attn(self.norm3(x), context, context_lens, dtype)
             # ffn function
             temp_x = self.norm2(x) * (1 + e[4]) + e[3]
             temp_x = temp_x.to(dtype)
@@ -714,6 +929,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         in_dim_control_adapter=24,
         add_ref_conv=False,
         in_dim_ref_conv=16,
+        gradient_checkpointing_rate=1,
+        # Audio part params
+        ai2v_enable=False,
+        audio_in_dim=768,
+        audio_proj_dim=768,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -770,6 +990,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.ai2v_enable = ai2v_enable
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -782,13 +1003,24 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
 
+        # audio project layer
+        if self.ai2v_enable:
+            self.audio_proj_model = AudioProjModel(
+                audio_in_dim=audio_in_dim, 
+                cross_attention_dim=audio_proj_dim,
+            )
+
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
+        if self.ai2v_enable and cross_attn_type == 'i2v_cross_attn':
+            cross_attn_type = 'ai2v_cross_attn'
         self.blocks = nn.ModuleList([
-            WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
+            WanAttentionBlock(cross_attn_type, dim, audio_proj_dim, ffn_dim, num_heads,
                               window_size, qk_norm, cross_attn_norm, eps)
             for _ in range(num_layers)
         ])
+        grad_ckpt_prefix = int(gradient_checkpointing_rate * num_layers)
+        self.block_gred_ckpt_enables = [i < grad_ckpt_prefix for i in range(num_layers)]
 
         # head
         self.head = Head(dim, out_dim, patch_size, eps)
@@ -876,7 +1108,17 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
-        
+    
+    def process_audio(self, audio_fea, num_frames):
+        audio_proj_fea = self.audio_proj_model(audio_fea)
+        pos_idx_ranges = split_audio_sequence(
+            audio_proj_fea.size(1), num_frames=num_frames
+        )
+        audio_proj_split, audio_context_lens = split_tensor_with_padding(
+            audio_proj_fea, pos_idx_ranges, expand_length=4
+        )
+        return audio_proj_split, audio_context_lens
+    
     def forward(
         self,
         x,
@@ -888,6 +1130,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         y_camera=None,
         full_ref=None,
         cond_flag=True,
+        audio_fea=None,
+        audio_scale=1.0,
     ):
         r"""
         Forward pass through the diffusion model
@@ -914,6 +1158,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         """
         if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
+        video_length = x.size(2)
         # params
         device = self.patch_embedding.weight.device
         dtype = x.dtype
@@ -997,6 +1242,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 self.teacache.should_calc = should_calc
             else:
                 should_calc = self.teacache.should_calc
+        # Audio process
+        if self.ai2v_enable:
+            audio_proj, audio_context_lens = self.process_audio(audio_fea, 4 * (video_length - 1) + 1)
         
         # TeaCache
         if self.teacache is not None:
@@ -1005,57 +1253,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 x = x + previous_residual.to(x.device)
             else:
                 ori_x = x.clone().cpu() if self.teacache.offload else x.clone()
-
-                for block in self.blocks:
-                    if torch.is_grad_enabled() and self.gradient_checkpointing:
-
-                        def create_custom_forward(module):
-                            def custom_forward(*inputs):
-                                return module(*inputs)
-
-                            return custom_forward
-                        ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                        x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block),
-                            x,
-                            e0,
-                            seq_lens,
-                            grid_sizes,
-                            self.freqs,
-                            context,
-                            context_lens,
-                            dtype,
-                            **ckpt_kwargs,
-                        )
-                    else:
-                        # arguments
-                        kwargs = dict(
-                            e=e0,
-                            seq_lens=seq_lens,
-                            grid_sizes=grid_sizes,
-                            freqs=self.freqs,
-                            context=context,
-                            context_lens=context_lens,
-                            dtype=dtype
-                        )
-                        x = block(x, **kwargs)
-                    
-                if cond_flag:
-                    self.teacache.previous_residual_cond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
-                else:
-                    self.teacache.previous_residual_uncond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
-        else:
-            for block in self.blocks:
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-
-                    def create_custom_forward(module):
-                        def custom_forward(*inputs):
-                            return module(*inputs)
-
-                        return custom_forward
-                    ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                    x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
+                for gred_ckpt_enable, block in zip(self.block_gred_ckpt_enables, self.blocks):
+                    kwargs = [
                         x,
                         e0,
                         seq_lens,
@@ -1063,21 +1262,70 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                         self.freqs,
                         context,
                         context_lens,
-                        dtype,
-                        **ckpt_kwargs,
+                        dtype
+                    ]
+                    if self.ai2v_enable:
+                        kwargs.extend([
+                            audio_proj,
+                            audio_context_lens,
+                            video_length,
+                            audio_scale,
+                        ])
+                    if torch.is_grad_enabled() and self.gradient_checkpointing and gred_ckpt_enable:
+
+                        def create_custom_forward(module):
+                            def custom_forward(*inputs):
+                                return module(*inputs)
+
+                            return custom_forward
+                        x = torch.utils.checkpoint.checkpoint(
+                            create_custom_forward(block),
+                            *kwargs,
+                            use_reentrant=False,
+                        )
+                    else:
+                        # arguments
+                        x = block(*kwargs)
+                    
+                if cond_flag:
+                    self.teacache.previous_residual_cond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
+                else:
+                    self.teacache.previous_residual_uncond = x.cpu() - ori_x if self.teacache.offload else x - ori_x
+        else:
+            for gred_ckpt_enable, block in zip(self.block_gred_ckpt_enables, self.blocks):
+                kwargs = [
+                    x,
+                    e0,
+                    seq_lens,
+                    grid_sizes,
+                    self.freqs,
+                    context,
+                    context_lens,
+                    dtype
+                ]
+                if self.ai2v_enable:
+                    kwargs.extend([
+                        audio_proj,
+                        audio_context_lens,
+                        video_length,
+                        audio_scale,
+                    ])
+                if torch.is_grad_enabled() and self.gradient_checkpointing and gred_ckpt_enable:
+
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs)
+
+                        return custom_forward
+                    # ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                    x = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        *kwargs,
+                        use_reentrant=False,
                     )
                 else:
                     # arguments
-                    kwargs = dict(
-                        e=e0,
-                        seq_lens=seq_lens,
-                        grid_sizes=grid_sizes,
-                        freqs=self.freqs,
-                        context=context,
-                        context_lens=context_lens,
-                        dtype=dtype
-                    )
-                    x = block(x, **kwargs)
+                    x = block(*kwargs)
 
         if self.sp_world_size > 1:
             x = get_sp_group().all_gather(x, dim=1)

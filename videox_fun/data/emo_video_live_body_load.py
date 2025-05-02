@@ -10,6 +10,8 @@ import imageio
 import numpy as np
 import torch
 import torchvision.transforms.v2 as transforms
+import librosa
+from transformers import Wav2Vec2Model, Wav2Vec2Processor
 from decord import VideoReader
 from omegaconf import OmegaConf
 from PIL import Image
@@ -34,6 +36,23 @@ def get_cache_file_list(cache_file_path, data_type):
         results.extend(item_paths)
     return results
 
+def get_audio_features(audio_processor, audio_path, start_time, end_time):
+    sr = 16000
+    audio_input, sample_rate = librosa.load(audio_path, sr=sr)  # 采样率为 16kHz
+
+    start_sample = int(start_time * sr)
+    end_sample = int(end_time * sr)
+
+    try:
+        audio_segment = audio_input[start_sample: end_sample]
+    except:
+        audio_segment = audio_input
+
+    input_values = audio_processor(
+        audio_segment, sampling_rate=sample_rate, return_tensors="pt"
+    ).input_values.cpu()
+    return input_values
+
 
 class LiveVideoLoadDataset(Dataset):
     def __init__(
@@ -45,12 +64,19 @@ class LiveVideoLoadDataset(Dataset):
         enable_bucket=False,
         resume_step=0,
         save_gt=False,
+        wav2vec_processor=None,
         **kwargs,
     ):
         super().__init__()
         self.cfg = cfg
         self.save_gt = save_gt
         assert enable_bucket, "use LiveVideoLoadDataset, must enable_bucket"
+        
+        self.wav2vec_processor = wav2vec_processor
+        if wav2vec_processor is not None:
+            self.ai2v_enable = True
+        else:
+            self.ai2v_enable = False
 
         cache_file_path_list = cfg.data.get("cache_file_path", [])
         self.resume_step = resume_step
@@ -94,7 +120,7 @@ class LiveVideoLoadDataset(Dataset):
         
         clip_target_idx = meta_result["clip_target_idx"].tolist()
         clip_st = clip_target_idx[0] / original_fps
-        clip_et = clip_target_idx[-1] / original_fps
+        clip_et = (clip_target_idx[-1] + 1) / original_fps
         face_id = meta_result["face_id"]
         crop_bbox = meta_result["crop_bbox"]
         
@@ -132,6 +158,17 @@ class LiveVideoLoadDataset(Dataset):
             bbox = convert_bbox_to_square_bbox(bbox, max_h, max_w, scale=eye_bbox_scale)
             return bbox, (max(landmarks_x) - min(landmarks_x)), (max(landmarks_y) - min(landmarks_y))
         
+        if self.ai2v_enable:
+            audio_path = f'{folder}/videos_resampled/{name}+audio.wav'
+            if not os.path.exists(audio_path):
+                audio_path = f'{folder}/videos_resampled/{name}+audiov4.wav'
+            assert os.path.exists(audio_path)
+            audio_feature = get_audio_features(self.wav2vec_processor, 
+                                               audio_path,
+                                               clip_st,
+                                               clip_et,)
+            if audio_feature.size(1) != 51840:
+                print(f"{audio_feature.shape=} {audio_path=} {clip_st=} {clip_et=} {clip_target_idx=}")
         mouth_bboxs = []
         left_eye_bboxs = []
         right_eye_bboxs = []
@@ -166,6 +203,9 @@ class LiveVideoLoadDataset(Dataset):
             "clip_et": clip_et,
         }
         sample["video_path"] = video_path
+        if self.ai2v_enable:
+            sample["audio_path"] = audio_path
+            sample["audio_feature"] = audio_feature[0]
         return sample
 
     def __getitem__(self, index):
@@ -192,19 +232,31 @@ import os, shutil
 import imageio
 import pickle
 import time
+import ffmpeg
 from tqdm import tqdm
 from einops import rearrange
 from accelerate.utils import set_seed
 
 def save_video(func_args):
-    save_path, visual_list, fps = func_args
-    imageio.mimwrite(save_path, visual_list, fps=fps)
+    # import pdb; pdb.set_trace()
+    save_path, visual_list, fps, audio_path, clip_st, clip_et = func_args
+    audio_clip_path = save_path[:-4] + ".wav"
+    save_path_tmp = save_path[:-4] + "_tmp.mp4"
+    imageio.mimwrite(save_path_tmp, visual_list, fps=fps)
+    ffmpeg.input(audio_path, ss=clip_st, to=clip_et).audio.output(audio_clip_path).run(overwrite_output=True)
+    ffmpeg.output(
+        (ffmpeg.input(save_path_tmp)).video,
+        (ffmpeg.input(audio_clip_path)).audio,
+        save_path,
+        vcodec="copy",
+        acodec="aac",
+        shortest=None,
+        loglevel="error",
+    ).run(overwrite_output=True)
+    os.remove(save_path_tmp)
+    os.remove(audio_clip_path)
 
 if __name__ == "__main__":
-    # RUN_FUNC = os.environ["RUN_FUNC"]
-    # RUN_FUNC = 'test_fast_video_dataset'
-    # print(f"{RUN_FUNC=}")
-    # eval(RUN_FUNC)()
     # /home/weili/miniconda3/envs/wan21_xc/bin/python 
     #    videox_fun/data/emo_video_live_body_load.py 
     #    --dataset_file_path 
@@ -220,6 +272,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_file_path", type=str, required=True)
+    parser.add_argument("--wav2vec_model_dir", type=str, default="models/wav2vec2-base-960h",)
     parser.add_argument("--data_type", type=str, default="video")
     
     parser.add_argument("--save_fps", type=int, default=25)
@@ -244,12 +297,14 @@ if __name__ == "__main__":
     config["data"]["eye_bbox_scale"] = args.eye_bbox_scale
     config["data"]["mouth_bbox_scale"] = args.mouth_bbox_scale
     config = OmegaConf.create(config)
+    wav2vec_processor = Wav2Vec2Processor.from_pretrained(args.wav2vec_model_dir)
     train_dataset = LiveVideoLoadDataset(
         # width=config.data.train_width,
         # height=config.data.train_height,
         cfg=config,
         split='train',
         enable_bucket=True,
+        wav2vec_processor=wav2vec_processor,
         resume_step=0,
         save_gt=True,
     )
@@ -278,6 +333,12 @@ if __name__ == "__main__":
                         print(f"{key=} {value.shape=}")
             import traceback;traceback.print_exc()
             return None
+    if args.num_workers == 0:
+        persistent_workers = False
+        prefetch_factor = None
+    else:
+        persistent_workers = True
+        prefetch_factor = 8
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=1,
@@ -285,8 +346,8 @@ if __name__ == "__main__":
         collate_fn=custom_collate_fn,
         num_workers=args.num_workers,
         pin_memory=False,
-        persistent_workers=True,
-        prefetch_factor=8,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
         # drop_last=True
     )
     writer_pool = multiprocessing.Pool(processes=args.writer_num_workers)
@@ -299,6 +360,8 @@ if __name__ == "__main__":
         #     print(k, v.shape, v.unique())
         # exit(0)
         video_path = batch["video_path"][0]
+        audio_path = batch["audio_path"][0]
+        audio_feature = batch["audio_feature"]
         pixel_values = batch["pixel_values"][0]
         union_mouth_masks = batch["union_mouth_masks"][0]
         mouth_masks = batch["mouth_masks"][0]
@@ -332,10 +395,10 @@ if __name__ == "__main__":
         
         if args.save_origin_video:
             shutil.copy(video_path, save_dir)
-        func_args = (save_path, visual_list, args.save_fps)
+        func_args = (save_path, visual_list, args.save_fps, audio_path, clip_st, clip_et)
+        # save_video(func_args)
         writer_result = writer_pool.apply_async(save_video, args=(func_args,))
         writer_results.append(writer_result)
-        
         while True:
             
             writer_results = [r for r in writer_results if not r.ready()]

@@ -134,8 +134,6 @@ def get_hands(hands_mmposes, score_mmposes, cur_face_id, wd, hd):
     for face_id in hands_mmposes:
         if face_id == cur_face_id: continue
         hands_mmpose, score_mmpose = hands_mmposes[face_id], score_mmposes[face_id]
-        # print(f"{score_mmpose=}")
-        # print(f"{score_mmpose.shape} {score_mmpose=}")
         score_mmpose = score_mmpose[:, 92:]
         for i, (scores_per_frame, hands_per_frame) in enumerate(zip(score_mmpose, hands_mmpose)):
             if np.any(scores_per_frame == -1):
@@ -179,25 +177,26 @@ def overlap_face(hands_boxes_cur, det):
 
 def get_subtitle(text_boxes, len_text_boxes, video_height):
     min_height_ratio=0.05
-    max_height_ratio=0.2
+    max_height_ratio=0.4
 
     upper_half_y_threshold = video_height * 0.2
     lower_half_y_threshold = video_height * 0.6
 
     text_detections = []
+    text_border_y_max = video_height
     for box in text_boxes:
         x_min, y_min, x_max, y_max = box
         y_center = (y_min + y_max) / 2
-
         height = y_max - y_min
         width = x_max - x_min
-    
-        if ((y_min > lower_half_y_threshold or y_max < upper_half_y_threshold) and 
-            height / video_height < max_height_ratio and 
-            width / height > 4):
+        subtitle_basic_cond = (height / video_height < max_height_ratio) and (width / height > 3.5)
+        if not subtitle_basic_cond: continue
+        if y_center > lower_half_y_threshold:
+            text_border_y_max = min(text_border_y_max, y_min)
+        if y_center < upper_half_y_threshold:
             text_detections.append(box)
 
-    return text_detections     
+    return text_detections, text_border_y_max
 
 def get_random_mask(shape, image_start_only=False):
     f, c, h, w = shape
@@ -333,7 +332,7 @@ def parse_rect_from_landmark(
     pt4,
     pts,
     scale=1.5,
-    ratio_scale=1.0,
+    # ratio_scale=1.0,
     vx_ratio=0,
     vy_ratio=0,
     use_deg_flag=False,
@@ -354,10 +353,8 @@ def parse_rect_from_landmark(
     else:
         uy /= l
     ux = np.array((uy[1], -uy[0]), dtype=DTYPE)
-
+    ux, uy = uy, ux
     # the rotation degree of the x-axis, the clockwise is positive, the counterclockwise is negative (image coordinate system)
-    # print(uy)
-    # print(ux)
     angle = acos(ux[0])
     if ux[1] < 0:
         angle = -angle
@@ -373,13 +370,17 @@ def parse_rect_from_landmark(
     center1 = (lt_pt + rb_pt) / 2
 
     size = rb_pt - lt_pt
-    if (size[0] / size[1]) > ratio_scale:
-        size[1] = size[0] / ratio_scale
-    else:
-        size[0] = size[1] * ratio_scale
+    # if (size[0] / size[1]) > ratio_scale:
+    #     size[1] = size[0] / ratio_scale
+    # else:
+    #     size[0] = size[1] * ratio_scale
     # print(f"{size=} {size[0] / size[1]=} {ratio_scale=}")
 
-    size *= scale  # scale size
+    if isinstance(scale, tuple):
+        size[0] = size[0] * scale[0]
+        size[1] = size[1] * scale[1]
+    else:
+        size *= scale
     center = center0 + ux * center1[0] + uy * center1[1]  # counterclockwise rotation, equivalent to M.T @ center1.T
     b_center = center
     center = center + ux * (vx_ratio * size[0]) + uy * \
@@ -595,12 +596,12 @@ class LiveVideoDataset(Dataset):
             vid_path += cur_res * weights
         
         # DEBUG -------------------------------------------
-        # debug_vid_path = []
-        # for data in vid_path:
-        #     video_dir_root, video_name = data
-        #     if "00701738-Scene-023" in video_name:
-        #         debug_vid_path.append(data)
-        # vid_path = debug_vid_path
+        debug_vid_path = []
+        for data in vid_path:
+            (video_dir_root, video_name), _ = data
+            if "005933_00593343-Scene-038" in video_name:
+                debug_vid_path.append(data)
+        vid_path = debug_vid_path
         # DEBUG -------------------------------------------
         
         #### for debug 
@@ -741,7 +742,7 @@ class LiveVideoDataset(Dataset):
         # original_fps = round(original_fps)
         target_frame_count = int((original_frame_count / original_fps) * target_fps)
         target_frame_indices = [
-            min(int((target_fps_pos / target_fps) * original_fps), original_frame_count - 1)
+            min(int(target_fps_pos * (original_fps / target_fps)), original_frame_count - 1)
             for target_fps_pos in range(target_frame_count)
         ]
         target_frame_indices = np.array(target_frame_indices)
@@ -753,7 +754,7 @@ class LiveVideoDataset(Dataset):
 
         clip_length = self.n_sample_frames + self.past_n
 
-        # check miss face kps
+        # Check miss face kps
         face_keypoints = video_metadata['frame_data']['keypoints'][face_id][target_frame_indices]
         miss_face_kps = (face_keypoints.reshape(len(face_keypoints), -1) == -1).all(-1)
         available_flag = ~miss_face_kps
@@ -762,15 +763,80 @@ class LiveVideoDataset(Dataset):
         if len(available_indices) < clip_length:
             raise Exception('no available segemnt')
         available_segment_list = find_continuous_video_segments(available_flag, clip_length)
-        
         if len(available_segment_list) == 0:
             raise Exception('no available segemnt')
         else:
             target_frame_indices_new = target_frame_indices[np.array(random.choice(available_segment_list))]
+        
+        # Get Fliter params
+        # 1. Fliter hand overlap: checking whether hand is appear in crop bbox
+        if not is_anime_data:
+            other_hands_boxes = get_hands(video_metadata["frame_data"]["hands_mmpose"],
+                            video_metadata["frame_data"]["score_mmpose"],
+                            face_id,
+                            wd, hd)
+        else:
+            other_hands_boxes = [[] for i in range(0, len(video_metadata['frame_data']['keypoints'][face_id]))]
+        available_flag = np.ones(len(target_frame_indices_new), dtype=bool)
+        
+        # 2. text overlap: Get Text bbox for fliter subtitle
+        if 'text_detection' in video_metadata:
+            text_boxes = video_metadata['text_detection']['text_boxes']
+            text_bounding_boxes_num = len(text_boxes)
+            # print(f"{text_bounding_boxes_num=}, text_detection")
+        elif 'text_bounding_boxes' in video_metadata:
+            text_boxes = video_metadata['text_bounding_boxes']
+            text_bounding_boxes_num = len(text_boxes)
+            # print(f"{text_bounding_boxes_num=}, text_bounding_boxes")
+        elif is_anime_data:
+            text_boxes = []
+            text_bounding_boxes_num = 0
+            # print(f"{text_bounding_boxes_num=}, don't have any")
+        else:
+            raise ValueError("This is not an anime data, We cannot check text")
+        
+        if not self.cfg.data.get("fliter_subtitle", True):
+            text_bounding_boxes_num = 0
+        # Some of them are watermarks that can be used as background. This data forces skipping the subtitle detection
+        text_boxes, text_border_y_max = get_subtitle(text_boxes, text_bounding_boxes_num, hd)
+        if "TheSkinDeep" in folder: 
+            text_bounding_boxes_num = 0
+            text_border_y_max = hd
+        
+        # 3. other human face or body overlap: Get faces_bbox_other for fliter overlap case with current select face_id
+        bbox_others = [[] for i in range(0, len(bounding_box_dict[face_id]))]
+        bounding_box_human = None
+        for track_id in bounding_box_dict:
+            if track_id == face_id:
+                continue
+            if "bounding_box_human" in video_metadata["frame_data"]:
+                bounding_box_human = video_metadata["frame_data"]["bounding_box_human"][track_id]
+            else:
+                bounding_box_human = bounding_box_dict[track_id]
+            for idx, det in enumerate(bounding_box_human):
+                if det[0] == -1 or det[1] == -1 or det[2] == -1 or det[3] == -1:
+                    continue
+                bbox_others[idx].append(det)
+        del bounding_box_human, track_id, det
+        # 4. Head pose fliter: Removes frames with too large a face orientation deviation
+        if "face_id_pair_hopenet" in video_metadata:
+            hopenet_params = video_metadata["face_id_pair_hopenet"][face_id]
+        elif "pose_max" in self.cfg.data:
+            raise ValueError(f"There is not hopenet_params in {video_path}")
+        else:
+            hopenet_params = [[0, 0, 0] for i in range(0, len(bounding_box_dict[face_id]))]
+        # 5. IQA Fliter: Removes frames with blurred faces
+        if "hyperIQA_frame_data" in video_metadata:
+            hyperIQA_params = video_metadata["hyperIQA_frame_data"][face_id]
+        elif "hyperIQA_min" in self.cfg.data:
+            raise ValueError(f"There is not hyperIQA_params in {video_path}")
+        else:
+            hyperIQA_params = [0 for i in range(0, len(bounding_box_dict[face_id]))]
+        
         # Get crop bbox by liveportrat
-        scale_crop_driving_video: float = self.cfg.data.driving_video_scale  # 2.0 # scale factor for cropping driving video
-        vx_ratio_crop_driving_video: float = self.cfg.data.get("vx_ratio_crop", 0)  # adjust x offset
-        vy_ratio_crop_driving_video: float = self.cfg.data.get("vy_ratio_crop", -0.2)  # adjust y offset
+        scale_crop_driving_video: tuple = self.cfg.data.driving_video_scale  # 2.0 # scale factor for cropping driving video
+        vx_ratio_crop_driving_video: float = self.cfg.data.vx_ratio_crop  # adjust x offset
+        vy_ratio_crop_driving_video: float = self.cfg.data.vy_ratio_crop  # adjust y offset
         
         face_keypoints = video_metadata['frame_data']['keypoints'][face_id]
         bodies_mmpose = video_metadata["frame_data"]["bodies_mmpose"][face_id]
@@ -837,8 +903,15 @@ class LiveVideoDataset(Dataset):
             
         del face_keypoint_perframe, mouth_landmarks, mouth_x, mouth_y, mouth_bbox, mouth_p, nose_landmarks, nose_x, nose_y, nose_bbox, nose_p, left_eye_landmarks, right_eye_landmarks, left_eye_x, left_eye_y, left_eye_bbox, left_eye_p, right_eye_x, right_eye_y, right_eye_bbox, right_eye_p, body_mmpose, body_score
         body_level_idx = body_level_prefix_dict[self.cfg.data.get("body_level", 3)]
+        if len(body_mmpose_list[8]) == 0 or len(body_mmpose_list[11]):
+            # For body level 2, use these scale and crop params is not enough
+            scale_crop_driving_video: tuple = self.cfg.data.level2_driving_video_scale  # 2.0 # scale factor for cropping driving video
+            vx_ratio_crop_driving_video: float = self.cfg.data.level2_vx_ratio_crop  # adjust x offset
+            vy_ratio_crop_driving_video: float = self.cfg.data.level2_vy_ratio_crop  # adjust y offset
+            body_mmpose_list[8] = []
+            body_mmpose_list[11] = []
         body_mmpose_list = [body_mmpose_list[i] for i in body_level_idx]
-        body_mmpose_array = np.array([np.array(body_mmpose).mean(axis=0) for body_mmpose in body_mmpose_list])
+        body_mmpose_array = np.array([np.array(body_mmpose).mean(axis=0) for body_mmpose in body_mmpose_list if len(body_mmpose) > 0])
         mouth_p = np.array(mouth_p_list).mean(axis=0)
         nose_p = np.array(nose_p_list).mean(axis=0)
         right_shoulder_p = np.array(right_shoulder_p_list).mean(axis=0)
@@ -853,96 +926,25 @@ class LiveVideoDataset(Dataset):
             scale=scale_crop_driving_video,
             vx_ratio=vx_ratio_crop_driving_video,
             vy_ratio=vy_ratio_crop_driving_video,
-            ratio_scale=(self.img_size[0] / self.img_size[1]),
+            # ratio_scale=(self.img_size[0] / self.img_size[1]),
         )["bbox"]
-        # crop_bbox = np.array([
-        #     ret_bbox[0, 0],
-        #     ret_bbox[0, 1],
-        #     ret_bbox[2, 0],
-        #     ret_bbox[2, 1],
-        # ])  # 4,
         crop_bbox = np.array([
             max(ret_bbox[0, 0], 0),
             max(ret_bbox[0, 1], 0),
             min(ret_bbox[2, 0], wd),
-            min(ret_bbox[2, 1], hd),
+            min(ret_bbox[2, 1], hd, text_border_y_max),
         ])
         cur_img_size = (int(crop_bbox[2] - crop_bbox[0]), int(crop_bbox[3] - crop_bbox[1]))
-        # cur_img_size = (crop_bbox[2] - crop_bbox[0], crop_bbox[3] - crop_bbox[1])
-        del body_mmpose_list, mouth_p, mouth_p_list, nose_p, nose_p_list, right_shoulder_p, right_shoulder_p_list, left_shoulder_p, left_shoulder_p_list, pts, ret_bbox, body_mmpose_array
+        del body_mmpose_list, mouth_p, mouth_p_list, nose_p, nose_p_list, right_shoulder_p, right_shoulder_p_list, left_shoulder_p, left_shoulder_p_list
+        del pts, ret_bbox, body_mmpose_array, text_border_y_max
         
-        # crop_bbox = average_bbox_lst(bbox_list)
-        # crop_bbox = mid_bbox_lst(bbox_list)
         center_x = (crop_bbox[0] + crop_bbox[2]) / 2
         center_y = (crop_bbox[1] + crop_bbox[3]) / 2
         center = [int(center_y), int(center_x)]
 
         ### filtering large translation by union_mask_img
         vid_batch_bbox = bounding_box[target_frame_indices_new]
-        union_bbox_full_video = get_move_area(vid_batch_bbox, wd, hd)
-        
-        # 1. Fliter hand overlap: checking whether hand is appear in crop bbox
-        if not is_anime_data:
-            hands_boxes = get_hands(video_metadata["frame_data"]["hands_mmpose"],
-                            video_metadata["frame_data"]["score_mmpose"],
-                            face_id,
-                            wd, hd)
-        else:
-            hands_boxes = [[] for i in range(0, len(video_metadata['frame_data']['keypoints'][face_id]))]
-        available_flag = np.ones(len(target_frame_indices_new), dtype=bool)
-        
-        # 2. text overlap: Get Text bbox for fliter subtitle
-        if 'text_detection' in video_metadata:
-            text_boxes = video_metadata['text_detection']['text_boxes']
-            text_bounding_boxes_num = len(text_boxes)
-            # print(f"{text_bounding_boxes_num=}, text_detection")
-        elif 'text_bounding_boxes' in video_metadata:
-            text_boxes = video_metadata['text_bounding_boxes']
-            text_bounding_boxes_num = len(text_boxes)
-            # print(f"{text_bounding_boxes_num=}, text_bounding_boxes")
-        elif is_anime_data:
-            text_boxes = []
-            text_bounding_boxes_num = 0
-            # print(f"{text_bounding_boxes_num=}, don't have any")
-        else:
-            raise ValueError("This is not an anime data, We cannot check text")
-        
-        if not self.cfg.data.get("fliter_subtitle", True):
-            text_bounding_boxes_num = 0
-        # Some of them are watermarks that can be used as background. This data forces skipping the subtitle detection
-        if "TheSkinDeep" in folder: 
-            text_bounding_boxes_num = 0
-        text_boxes = get_subtitle(text_boxes, text_bounding_boxes_num, hd)
-        
-        # # 3. other human face or body overlap: Get faces_bbox_other for fliter overlap case with current select face_id
-        bbox_others = [[] for i in range(0, len(bounding_box_dict[face_id]))]
-        bounding_box_human = None
-        for track_id in bounding_box_dict:
-            if track_id == face_id:
-                continue
-            if "bounding_box_human" in video_metadata["frame_data"]:
-                bounding_box_human = video_metadata["frame_data"]["bounding_box_human"][track_id]
-            else:
-                bounding_box_human = bounding_box_dict[track_id]
-            for idx, det in enumerate(bounding_box_human):
-                if det[0] == -1 or det[1] == -1 or det[2] == -1 or det[3] == -1:
-                    continue
-                bbox_others[idx].append(det)
-        del bounding_box_human, track_id, det
-        # 4. Head pose fliter: Removes frames with too large a face orientation deviation
-        if "face_id_pair_hopenet" in video_metadata:
-            hopenet_params = video_metadata["face_id_pair_hopenet"][face_id]
-        elif "pose_max" in self.cfg.data:
-            raise ValueError(f"There is not hopenet_params in {video_path}")
-        else:
-            hopenet_params = [[0, 0, 0] for i in range(0, len(bounding_box_dict[face_id]))]
-        # 5. IQA Fliter: Removes frames with blurred faces
-        if "hyperIQA_frame_data" in video_metadata:
-            hyperIQA_params = video_metadata["hyperIQA_frame_data"][face_id]
-        elif "hyperIQA_min" in self.cfg.data:
-            raise ValueError(f"There is not hyperIQA_params in {video_path}")
-        else:
-            hyperIQA_params = [0 for i in range(0, len(bounding_box_dict[face_id]))]
+        # union_bbox_full_video = get_move_area(vid_batch_bbox, wd, hd)
 
         # start fliter 1,2,3,4
         if text_bounding_boxes_num > 0:
@@ -952,7 +954,7 @@ class LiveVideoDataset(Dataset):
         hyperIQA_min = self.cfg.data.get("hyperIQA_min", 0)
         lip_open_ratio = self.cfg.data.get("lip_open_ratio", 0)
         for i in range(len(available_flag)):
-            available_flag[i] = available_flag[i] & (not overlap_face(hands_boxes[target_frame_indices_new[i]], crop_bbox))
+            available_flag[i] = available_flag[i] & (not overlap_face(other_hands_boxes[target_frame_indices_new[i]], crop_bbox))
             available_flag[i] = available_flag[i] & (not overlap_face(bbox_others[target_frame_indices_new[i]], crop_bbox))
             yaw, pitch, roll = hopenet_params[target_frame_indices_new[i]]
             available_flag[i] = available_flag[i] & (abs(yaw) <= hopenet_pose_max[0] and abs(pitch) <= hopenet_pose_max[1] and abs(roll) <= hopenet_pose_max[2])
@@ -1012,7 +1014,7 @@ class LiveVideoDataset(Dataset):
                 raise Exception('This video has missing face keypoints in some frames') 
             
             for i in all_indices:
-                assert not overlap_face(hands_boxes[i], crop_bbox), f"Error, At {i} frame, hand is appear"
+                assert not overlap_face(other_hands_boxes[i], crop_bbox), f"Error, At {i} frame, hand is appear"
                 assert not overlap_face(bbox_others[i], crop_bbox), f"Error, At {i} frame, Other Face is appear"
                 
         # Read target frames
@@ -1181,6 +1183,10 @@ def save_video_as_image(func_args):
     with open(os.path.join(save_dir_item, "meta_result.pkl"), 'wb') as f:
         pickle.dump(meta_result, f) 
 
+def save_video(func_args):
+    save_path, visual_list, fps = func_args
+    imageio.mimwrite(save_path, visual_list, fps=fps)
+
 if __name__ == "__main__":
     # How to use this script ?
     # save_visual is default mode, save visual video, mask and i2v condition
@@ -1206,9 +1212,12 @@ if __name__ == "__main__":
     #    --past_n default 4
     #    --train_fps default 25
     #    --ignore_hyperIQA # if haven't process this params, store true to ignore it !
-    #    --driving_video_scale default 1.2
+    #    --driving_video_scale default (1.5, 1.8)
     #    --vx_ratio_crop default -0.20
     #    --vy_ratio_crop default 0
+    #    --level2_driving_video_scale default (1.5, 1.8)
+    #    --level2_vx_ratio_crop default -0.10
+    #    --level2_vy_ratio_crop default 0
     #    --lip_open_ratio default 0.
     #    --hyperIQA_min default 30
     #    --audio_dyadic_conf_thresh 0 # suggest 6 for dyadic
@@ -1240,9 +1249,12 @@ if __name__ == "__main__":
     parser.add_argument("--past_n", type=int, default=4)
     parser.add_argument("--train_fps", type=int, default=25)
     # LivePortrait args
-    parser.add_argument("--driving_video_scale", type=float, default=1.2)
-    parser.add_argument("--vx_ratio_crop", type=float, default=-0.20)
-    parser.add_argument("--vy_ratio_crop", type=float, default=0)
+    parser.add_argument("--driving_video_scale", type=tuple, default=(1.5, 1.8))
+    parser.add_argument("--vx_ratio_crop", type=float, default=0)
+    parser.add_argument("--vy_ratio_crop", type=float, default=-0.2)
+    parser.add_argument("--level2_driving_video_scale", type=tuple, default=(1.5, 2.2))
+    parser.add_argument("--level2_vx_ratio_crop", type=float, default=0)
+    parser.add_argument("--level2_vy_ratio_crop", type=float, default=-0.2)
     # HopeNet args
     parser.add_argument("--yaw_max", type=float, default=45)
     parser.add_argument("--pitch_max", type=float, default=40)
@@ -1291,6 +1303,9 @@ if __name__ == "__main__":
     config["data"]["driving_video_scale"] = args.driving_video_scale
     config["data"]["vx_ratio_crop"] = args.vx_ratio_crop
     config["data"]["vy_ratio_crop"] = args.vy_ratio_crop
+    config["data"]["level2_driving_video_scale"] = args.level2_driving_video_scale
+    config["data"]["level2_vx_ratio_crop"] = args.level2_vx_ratio_crop
+    config["data"]["level2_vy_ratio_crop"] = args.level2_vy_ratio_crop
     config["data"]["pose_max"] = [args.yaw_max, args.pitch_max, args.roll_max]
     config["data"]["pose_delta"] = [args.yaw_delta, args.pitch_delta, args.roll_delta]
     config["data"]["lip_open_ratio"] = args.lip_open_ratio
@@ -1340,6 +1355,12 @@ if __name__ == "__main__":
                         print(f"{key=} {value.shape=}")
             import traceback;traceback.print_exc()
             return None
+    if args.num_workers == 0:
+        persistent_workers = False
+        prefetch_factor = None
+    else:
+        persistent_workers = True
+        prefetch_factor = 8
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=1,
@@ -1347,13 +1368,12 @@ if __name__ == "__main__":
         collate_fn=custom_collate_fn,
         num_workers=args.num_workers,
         pin_memory=False,
-        persistent_workers=True,
-        prefetch_factor=8,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
         # drop_last=True
     )
-    if args.save_cache:
-        writer_pool = multiprocessing.Pool(processes=args.writer_num_workers)
-        writer_results = []
+    writer_pool = multiprocessing.Pool(processes=args.writer_num_workers)
+    writer_results = []
     
     for i, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader)):
         # continue
@@ -1369,7 +1389,7 @@ if __name__ == "__main__":
         crop_bbox = batch["crop_bbox"][0].cpu().numpy()
         clip_target_idx = batch["clip_target_idx"][0].cpu().numpy()
         if not args.no_save_visual:
-            save_dir = visual_dir_name + f"_{args.driving_video_scale}"
+            save_dir = visual_dir_name + f"_{args.driving_video_scale[0]}_{args.driving_video_scale[1]}"
             os.makedirs(save_dir, exist_ok=True)
             mask_pixel_values = batch["mask_pixel_values"][0]
             mask = batch["mask"][0]
@@ -1399,7 +1419,15 @@ if __name__ == "__main__":
             
             video_base = os.path.basename(video_path)[:-4]
             save_path = f"./{save_dir}/{i}_{video_base}.mp4"
-            imageio.mimwrite(save_path, visual_list, fps=args.save_fps)
+            func_args = (save_path, visual_list, args.save_fps)
+            writer_result = writer_pool.apply_async(save_video, args=(func_args,))
+            writer_results.append(writer_result)
+            while True:
+                writer_results = [r for r in writer_results if not r.ready()]
+                if len(writer_results) >= args.writer_num_workers + 2:
+                    time.sleep(0.5)
+                else:
+                    break
         
         if args.save_origin_video:
             shutil.copy(video_path, save_dir)
@@ -1437,13 +1465,12 @@ if __name__ == "__main__":
             while True:
                 writer_results = [r for r in writer_results if not r.ready()]
                 if len(writer_results) >= args.writer_num_workers + 2:
-                    time.sleep(0.3)
+                    time.sleep(0.2)
                 else:
                     break
-    if args.save_cache:
-        writer_pool.close()
-        writer_pool.join()
-        print(f"Finish cache all data")
+    writer_pool.close()
+    writer_pool.join()
+    print(f"Finish write all data")
             
             
              

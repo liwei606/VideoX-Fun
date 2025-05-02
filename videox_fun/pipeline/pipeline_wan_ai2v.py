@@ -148,7 +148,7 @@ class WanPipelineOutput(BaseOutput):
     videos: torch.Tensor
 
 
-class WanFunInpaintPipeline(DiffusionPipeline):
+class WanAI2VPipeline(DiffusionPipeline):
     r"""
     Pipeline for text-to-video generation using Wan.
 
@@ -177,7 +177,12 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         super().__init__()
 
         self.register_modules(
-            tokenizer=tokenizer, text_encoder=text_encoder, vae=vae, transformer=transformer, clip_image_encoder=clip_image_encoder, scheduler=scheduler
+            tokenizer=tokenizer, 
+            text_encoder=text_encoder, 
+            vae=vae, 
+            transformer=transformer, 
+            clip_image_encoder=clip_image_encoder, 
+            scheduler=scheduler,
         )
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae.spacial_compression_ratio)
@@ -495,6 +500,7 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         clip_image: Image = None,
         audio_wav2vec_fea: Optional[torch.FloatTensor] = None,
+        audio_scale: float = 1.0,
         max_sequence_length: int = 512,
         comfyui_progressbar: bool = False,
         cfg_skip_ratio: int = None,
@@ -685,7 +691,8 @@ class WanFunInpaintPipeline(DiffusionPipeline):
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
-                
+                audio_scale_tensor = torch.ones((latent_model_input.shape[0],))
+                audio_scale_tensor[0], audio_scale_tensor[1] = 0 * audio_scale_tensor[0], audio_scale * audio_scale_tensor[1]
                 # predict noise model_output
                 with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=device):
                     noise_pred = self.transformer(
@@ -695,6 +702,8 @@ class WanFunInpaintPipeline(DiffusionPipeline):
                         seq_len=seq_len,
                         y=y,
                         clip_fea=clip_context_input,
+                        audio_fea=torch.cat([audio_wav2vec_fea, audio_wav2vec_fea]).cuda(),
+                        audio_scale=audio_scale_tensor.to(audio_wav2vec_fea),
                     )
 
                 # perform guidance
