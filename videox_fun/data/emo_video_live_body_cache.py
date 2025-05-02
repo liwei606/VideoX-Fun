@@ -177,28 +177,6 @@ def overlap_face(hands_boxes_cur, det):
         overlap_sum_value += overlap_area / area_face
     return overlap_sum_value >= 0.01
 
-# def get_subtitle(text_boxes, len_text_boxes, video_height):
-#     min_height_ratio=0.05
-#     max_height_ratio=0.45
-
-#     upper_half_y_threshold = video_height * 0.2
-#     lower_half_y_threshold = video_height * 0.6
-
-#     text_detections = []
-#     for box in text_boxes:
-#         x_min, y_min, x_max, y_max = box
-#         y_center = (y_min + y_max) / 2
-
-#         height = y_max - y_min
-#         width = x_max - x_min
-    
-#         if ((y_center > lower_half_y_threshold or y_center < upper_half_y_threshold) and 
-#             height / video_height < max_height_ratio and 
-#             width / height > 2):
-#             text_detections.append(box)
-
-#     return text_detections
-
 def get_subtitle(text_boxes, len_text_boxes, video_height):
     min_height_ratio=0.05
     max_height_ratio=0.2
@@ -522,9 +500,6 @@ def crop_image(imgs, pt4: np.ndarray, pts: np.ndarray, **kwargs):
 def crop_image_by_bbox(img, bbox, lmk=None, dsize=(512, 768), angle=None, flag_rot=False, **kwargs):
     # dsize: (width, height)
     left, top, right, bot = bbox
-    # if abs(((right - left) / (bot - top)) - (dsize[0] / dsize[1])) > 1e-5:
-        # print(f'right-left {right-left} != bot-top {bot-top}')
-        # print(f"{((right - left) / (bot - top))} != {(dsize[0] / dsize[1])}")
     size = (right - left, bot - top)
 
     src_center = np.array([(left + right) / 2, (top + bot) / 2], dtype=DTYPE)
@@ -548,23 +523,11 @@ def crop_image_by_bbox(img, bbox, lmk=None, dsize=(512, 768), angle=None, flag_r
             dtype=DTYPE
         )
 
-    # if flag_rot and angle is None:
-        # print('angle is None, but flag_rotate is True', style="bold yellow")
-
     img_crop = _transform_img(img, M_o2c, dsize=dsize, borderMode=kwargs.get('borderMode', None))
-    # lmk_crop = _transform_pts(lmk, M_o2c) if lmk is not None else None
 
     M_o2c = np.vstack([M_o2c, np.array([0, 0, 1], dtype=DTYPE)])
     M_c2o = np.linalg.inv(M_o2c)
 
-    # cv2.imwrite('crop.jpg', img_crop)
-
-    # return {
-    #     'img_crop': img_crop,
-    #     # 'lmk_crop': lmk_crop,
-    #     'M_o2c': M_o2c,
-    #     'M_c2o': M_c2o,
-    # }
     return img_crop
 
 def average_bbox_lst(bbox_lst):
@@ -1077,26 +1040,7 @@ class LiveVideoDataset(Dataset):
         ref_img = crop_image_by_bbox(np.array(ref_img), crop_bbox, dsize=cur_img_size)
         vid_pil_image_list = [crop_image_by_bbox(np.array(img), crop_bbox, dsize=cur_img_size) for img in vid_pil_image_list]
         vid_pil_image_past = [crop_image_by_bbox(np.array(img), crop_bbox, dsize=cur_img_size) for img in vid_pil_image_past]
-        # union_mask_img = crop_image_by_bbox(np.array(union_mask_img), crop_bbox, size=self.cfg.data.train_width)
 
-        # FLIP_FLAG = False
-        # if self.flip_aug and random.random() < 0.5:
-        #     ref_img = np.flip(ref_img, axis=1).copy()
-        #     vid_pil_image_list = [np.flip(img, axis=1).copy() for img in vid_pil_image_list]
-        #     vid_pil_image_past = [np.flip(img, axis=1).copy() for img in vid_pil_image_past]
-        #     # union_mask_img = np.flip(union_mask_img, axis=1).copy()
-        #     FLIP_FLAG = True
-        
-        # Transform
-        # state = torch.get_rng_state()
-
-        # pixel_values_vid = self.augmentation(vid_pil_image_list, self.pixel_norm, state)
-        # pixel_values_ref_img = self.augmentation([ref_img] + vid_pil_image_past, self.pixel_norm, state)
-        # union_mask_img = self.augmentation([union_mask_img], self.pixel_norm, state)
-        # union_mask_img = (union_mask_img[0] + 1) / 2
-        
-        # pixel_values_vid_original = pixel_values_vid.clone()
-        # pixel_values_ref_img_original = pixel_values_ref_img.clone()
         clip_st = target_frame_indices_new[past_batch_index[0]] / original_fps
         clip_et = target_frame_indices_new[tgt_batch_index[-1]] / original_fps
         wav_st = int(clip_st * target_fps)
@@ -1112,279 +1056,6 @@ class LiveVideoDataset(Dataset):
             crop_bbox=crop_bbox,
             clip_target_idx=target_frame_indices_new[past_batch_index + tgt_batch_index],
         )
-        # for pixel_values_vid_original_i, vid_pil_image in zip(pixel_values_vid_original, vid_pil_image_list):
-        #     if (pixel_values_vid_original_i * 255).mean() <= 1 or vid_pil_image.mean() <= 1: 
-        #         print(f"After augmentation {pixel_values_vid_original_i.mean()=}")
-        #         print(f"Before augmentation {vid_pil_image.mean()=}")
-
-        # all_pixel_values = torch.cat([pixel_values_vid, pixel_values_ref_img], dim=0)
-        # all_pixel_values = (all_pixel_values + 1) / 2
-
-        # if self.cfg.data.hybrid_face_mask:
-        #     ## generate face mask for crop image
-        #     all_indices = target_frame_indices_new[tgt_batch_index].tolist() + [tfi_copy[ref_img_idx]] + target_frame_indices_new[past_batch_index].tolist()
-            
-        #     face_keypoints = video_metadata['frame_data']['keypoints'][face_id][all_indices]
-        #     batch_lip_movements = [lip_movements[i] for i in all_indices]
-        #     miss_face_kps = (face_keypoints.reshape(len(face_keypoints), -1) == -1).all(-1)
-        #     if miss_face_kps.any():
-        #         print(f"{miss_face_kps=}")
-        #         raise Exception('This video has missing face keypoints in some frames') 
-            
-        #     for i in all_indices:
-        #         assert not overlap_face(hands_boxes[i], crop_bbox), f"Error, At {i} frame, hand is appear"
-        #         assert not overlap_face(bbox_others[i], crop_bbox), f"Error, At {i} frame, Other Face is appear"
-
-        #     updated_h, updated_w = int((crop_bbox[3] - crop_bbox[1])), int((crop_bbox[2] - crop_bbox[0]))
-        #     if is_anime_data:
-        #         face_keypoints = face_keypoints.reshape(-1, 68, 2)
-        #     face_keypoints[:, :, 0] *= wd
-        #     face_keypoints[:, :, 1] *= hd
-
-        #     face_keypoints[:, :, 0] += updated_w/2 - center_x
-        #     face_keypoints[:, :, 1] += updated_h/2 - center_y
-            
-        #     face_keypoints[:, :, 0] *= self.img_size[0] / updated_w
-        #     face_keypoints[:, :, 1] *= self.img_size[1] / updated_h
-            
-        #     face_keypoints[:, :, 0] = np.clip(face_keypoints[:, :, 0], 0, self.img_size[0])
-        #     face_keypoints[:, :, 1] = np.clip(face_keypoints[:, :, 1], 0, self.img_size[1])
-
-        #     if FLIP_FLAG:
-        #         face_keypoints[:, :, 0] = self.img_size[0] - face_keypoints[:, :, 0]
-        #     past_frames_kps = face_keypoints[-len(target_frame_indices_new[past_batch_index]):]  
-        #     target_frames_kps = face_keypoints[:len(target_frame_indices_new[tgt_batch_index])] 
-        #     face_keypoints_original = np.concatenate([past_frames_kps, target_frames_kps], axis=0)[:,:,:2] 
-
-        #     # print(f"[DEBUG] Original Dataloader Face Keypoints: {face_keypoints.shape}")
-        #     # Get eye bounding boxes (left eye: landmarks 33-133, right eye: landmarks 362-263)
-        #     def get_face_box(landmark_name, face_landmarks, max_w, max_h, eye_bbox_scale=1.5):
-        #         if not is_anime_data:
-        #             if landmark_name == 'left_eye':
-        #                 landmarks = [398, 384, 385, 386, 387, 388, 466, 263, 249, 390, 373, 374, 380, 381, 382, 362]
-        #             elif landmark_name == 'right_eye':
-        #                 landmarks = [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7]
-        #             elif landmark_name == 'mouth':
-        #                 landmarks = [61, 146, 146, 91, 91, 181, 181, 84, 84, 17, 17, 314, 314, 405, 405, 321, 321, 375, 375, 291, 61, 185, 185, 40, 40, 39, 39, 37, 37, 0, 0, 267, 267, 269, 269, 270, 270, 409, 409, 291, 78, 95, 95, 88, 88, 178, 178, 87, 87, 14, 14, 317, 317, 402, 402, 318, 318, 324, 324, 308, 78, 191, 191, 80, 80, 81, 81, 82, 82, 13, 13, 312, 312, 311, 311, 310, 310, 415, 415, 308]
-        #         else:
-        #             if landmark_name == 'left_eye':
-        #                 landmarks = [18, 19, 20, 21, 22, 37, 38, 39, 40, 41, 42]
-        #             elif landmark_name == 'right_eye':
-        #                 landmarks = [23, 24, 25, 26, 27, 43, 44, 45, 46, 47, 48]
-        #             elif landmark_name == 'mouth':
-        #                 landmarks = list(range(49, 69))
-        #             landmarks = [x - 1 for x in landmarks] 
-                
-        #         landmarks_x = [int(np.clip(face_landmarks[idx][0], 0, max_w)) for idx in landmarks]
-        #         landmarks_y = [int(np.clip(face_landmarks[idx][1], 0, max_h)) for idx in landmarks]
-        #         bbox = [(min(landmarks_x), min(landmarks_y)), (max(landmarks_x), max(landmarks_y))]
-        #         bbox = convert_bbox_to_square_bbox(bbox, max_h, max_w, scale=eye_bbox_scale)
-        #         return bbox, (max(landmarks_x) - min(landmarks_x)), (max(landmarks_y) - min(landmarks_y))
-            
-        #     def get_face_contour(face_landmarks, h, w):
-        #         face_contour = np.zeros((h, w, 3), dtype=np.uint8)
-        #         face_contour_bbox = []
-        #         for landmark_id, landmark in enumerate(face_landmarks):
-        #             cx, cy = landmark[:2]
-        #             cx, cy  = int(cx), int(cy)
-        #             if cy >= h or cx >= w: continue
-        #             if cy < 0 or cx < 0: continue
-        #             face_contour[cy, cx] = (255, 255, 255)
-                    
-        #         return face_contour
-            
-        #     def get_eyeball(face_landmarks, h, w, left_size, right_size):
-        #         eyeball = np.zeros((h, w, 3), dtype=np.uint8)
-        #         for landmark_id, landmark in enumerate(face_landmarks):
-        #             cx, cy = landmark[:2]
-        #             cx, cy  = int(cx), int(cy)
-        #             if landmark_id not in [468, 473]: continue
-        #             if cy >= h or cx >= w: continue
-        #             if cy < 0 or cx < 0: continue
-        #             radius = int(left_size // 3) if landmark_id == 468 else int(right_size // 3)
-        #             # print(f"{radius=}")
-        #             cv2.circle(eyeball, (cx, cy), radius=radius, color=(255, 0, 0), thickness=-1)
-        #             # DEBUG ------------------------------------------
-        #         return eyeball, (eyeball.sum(axis=2) != 0)[:, :, None]
-
-        #     batch_left_eye_bbox = []
-        #     batch_right_eye_bbox = []
-        #     batch_mouth_bbox = []
-
-        #     batch_mouth_mask = []
-        #     batch_mouth_mask_no_scale = []
-        #     batch_eye_mask = []
-        #     batch_eye_mask_no_scale = []
-        #     batch_face_contour = []
-        #     batch_eyeball = []
-        #     batch_eyeball_mask = []
-        #     for kps in face_keypoints:
-        #         # Get eye, mouth, scaling mask
-        #         left_eye_bbox, xbz, ybz = get_face_box('left_eye', kps, self.img_size[0], self.img_size[1], self.cfg.data.eye_bbox_scale)
-        #         right_eye_bbox, xbz, ybz = get_face_box('right_eye', kps, self.img_size[0], self.img_size[1], self.cfg.data.eye_bbox_scale)
-        #         mouth_bbox, xbz, ybz = get_face_box('mouth',  kps, self.img_size[0], self.img_size[1], self.cfg.data.mouth_bbox_scale)
-                
-        #         mouth_masks = np.array(get_mask(mouth_bbox, self.img_size[1], self.img_size[0], scale=1.0))
-        #         left_eye_masks = np.array(get_mask(left_eye_bbox, self.img_size[1], self.img_size[0], scale=1.0))
-        #         right_eye_masks = np.array(get_mask(right_eye_bbox, self.img_size[1], self.img_size[0], scale=1.0))
-        #         eye_mask = np.array(left_eye_masks) + np.array(right_eye_masks)
-                
-        #         face_contour_masks = get_face_contour(kps, self.img_size[1], self.img_size[0])
-
-        #         batch_mouth_mask.append(mouth_masks)
-        #         batch_eye_mask.append(eye_mask)
-        #         batch_face_contour.append(face_contour_masks)
-                
-        #         # Get eye, mouth, origin mask and eyeball
-        #         left_eye_bbox, le_xbz, le_ybz = get_face_box('left_eye', kps, self.img_size[0], self.img_size[1], 1)
-        #         right_eye_bbox, re_xbz, re_ybz = get_face_box('right_eye', kps, self.img_size[0], self.img_size[1], 1)
-        #         mouth_bbox, xbz, ybz = get_face_box('mouth',  kps, self.img_size[0], self.img_size[1], 1)
-                
-        #         batch_left_eye_bbox.append(left_eye_bbox)
-        #         batch_right_eye_bbox.append(right_eye_bbox)
-        #         batch_mouth_bbox.append(mouth_bbox)
-
-        #         mouth_masks = np.array(get_mask(mouth_bbox, self.img_size[1], self.img_size[0], scale=1.0))
-        #         left_eye_masks = np.array(get_mask(left_eye_bbox, self.img_size[1], self.img_size[0], scale=1.0))
-        #         right_eye_masks = np.array(get_mask(right_eye_bbox, self.img_size[1], self.img_size[0], scale=1.0))
-        #         eye_mask = np.array(left_eye_masks) + np.array(right_eye_masks)
-                
-        #         eyeball, eyeball_mask = get_eyeball(kps, self.img_size[1], self.img_size[0], left_size=le_ybz, right_size=re_ybz)
-        #         batch_eyeball.append(eyeball)
-        #         batch_eyeball_mask.append(eyeball_mask)
-                
-        #         batch_mouth_mask_no_scale.append(mouth_masks)
-        #         batch_eye_mask_no_scale.append(eye_mask)
-                
-        #     batch_mouth_mask = np.array(batch_mouth_mask)
-        #     batch_eye_mask = np.array(batch_eye_mask)
-        #     batch_face_contour = np.array(batch_face_contour)
-        #     batch_eyeball = np.array(batch_eyeball)
-        #     batch_eyeball_mask = np.array(batch_eyeball_mask)
-            
-        #     batch_left_eye_bbox = np.array(batch_left_eye_bbox)
-        #     batch_right_eye_bbox = np.array(batch_right_eye_bbox)
-        #     batch_mouth_bbox = np.array(batch_mouth_bbox)
-        #     batch_lip_movements = np.array(batch_lip_movements)
-
-        #     batch_mouth_mask_no_scale = np.array(batch_mouth_mask_no_scale)
-        #     batch_eye_mask_no_scale = np.array(batch_eye_mask_no_scale)
-            
-        #     eye_mouth_mask = batch_mouth_mask | batch_eye_mask
-        #     eye_mouth_mask = torch.from_numpy(eye_mouth_mask / 255.0).permute(0,3,1,2)
-        #     eye_mouth_mask_no_scale = batch_mouth_mask_no_scale | batch_eye_mask_no_scale
-        #     eye_mouth_mask_no_scale = torch.from_numpy(eye_mouth_mask_no_scale / 255.0).permute(0,3,1,2)
-        #     batch_eyeball_mask = torch.from_numpy(batch_eyeball_mask).permute(0,3,1,2)
-        #     all_pixel_values = all_pixel_values * eye_mouth_mask
-            
-        #     pixel_values_face_contour = torch.from_numpy(batch_face_contour / 255.0).permute(0,3,1,2)
-        #     batch_eyeball = torch.from_numpy(batch_eyeball / 255.0).permute(0,3,1,2)
-        #     pixel_values_face_contour = pixel_values_face_contour * (1-eye_mouth_mask)
-        #     all_pixel_values = all_pixel_values + pixel_values_face_contour
-        #     all_pixel_values_eyeball = all_pixel_values * (~batch_eyeball_mask) + batch_eyeball * batch_eyeball_mask
-        #     all_pixel_values = all_pixel_values.float()
-        #     all_pixel_values_eyeball = all_pixel_values_eyeball.float()
-
-        #     ref_img = all_pixel_values[len(pixel_values_vid_original):]
-        #     pixel_values_vid = all_pixel_values[:len(pixel_values_vid_original)]
-        #     eyeball_ref_img = all_pixel_values_eyeball[len(pixel_values_vid_original):]
-        #     eyeball_pixel_values_vid = all_pixel_values_eyeball[:len(pixel_values_vid_original)]
-            
-        #     # only need one channel 
-        #     eye_mouth_mask_past_frames = eye_mouth_mask[len(pixel_values_vid_original):][1:,:1,:,:].float()
-        #     eye_mouth_mask_vid = eye_mouth_mask[:len(pixel_values_vid_original)][:,:1,:,:].float()
-        #     eye_mouth_mask_no_scale_past_frames = eye_mouth_mask_no_scale[len(pixel_values_vid_original):][1:,:1,:,:].float()
-        #     eye_mouth_mask_no_scale_vid = eye_mouth_mask_no_scale[:len(pixel_values_vid_original)][:,:1,:,:].float()
-        
-        # else:
-        #     ref_img = all_pixel_values[len(pixel_values_vid_original):]
-        #     pixel_values_vid = all_pixel_values[:len(pixel_values_vid_original)]
-
-        #     h, w = pixel_values_vid_original.shape[2:]
-        #     eye_mouth_mask_vid=torch.zeros((self.n_sample_frames, 1, h, w))
-        #     eye_mouth_mask_past_frames=torch.zeros((self.past_n, 1, h, w))
-        
-        # # only the first frames is reference image, other frames are vid_pil_image_past
-        # pixel_values_past_frames = ref_img[1:]
-        # ref_img = ref_img[0] 
-        # eyeball_past_frames = eyeball_ref_img[1:]
-        # eyeball_ref_img = eyeball_ref_img[0]
-        
-        # ref_img_original = pixel_values_ref_img_original[0] # only the first frames is reference image, other frames are vid_pil_image_past
-        # pixel_values_past_frames_original = pixel_values_ref_img_original[1:]
-
-        # if not self.zero_to_one:
-        #     ### should be [-1, 1]
-        #     pixel_values_vid = pixel_values_vid * 2 - 1
-        #     ref_img = ref_img * 2 - 1
-        #     pixel_values_past_frames = pixel_values_past_frames * 2 - 1
-        #     eyeball_past_frames = eyeball_past_frames * 2 - 1
-        #     eyeball_ref_img = eyeball_ref_img * 2 - 1
-        #     eyeball_pixel_values_vid = eyeball_pixel_values_vid * 2 - 1
-
-        #     assert ref_img_original.min() < 0 and ref_img_original.max() <= 1
-        #     assert pixel_values_vid_original.min() < 0 and pixel_values_vid_original.max() <= 1
-        #     assert pixel_values_past_frames_original.min() < 0 and pixel_values_past_frames_original.max() <= 1
-        #     assert pixel_values_vid.min() < 0 and pixel_values_vid.max() <= 1
-        #     assert ref_img.min() < 0 and ref_img.max() <= 1
-        #     assert pixel_values_past_frames.min() < 0 and pixel_values_past_frames.max() <= 1
-        # else:
-        #     ref_img_original = (ref_img_original + 1) / 2
-        #     pixel_values_vid_original = (pixel_values_vid_original + 1) / 2
-        #     pixel_values_past_frames_original = (pixel_values_past_frames_original + 1) / 2
-
-        #     assert ref_img_original.min() >= 0 and ref_img_original.max() <= 1
-        #     assert pixel_values_vid_original.min() >= 0 and pixel_values_vid_original.max() <= 1
-        #     assert pixel_values_past_frames_original.min() >= 0 and pixel_values_past_frames_original.max() <= 1
-        #     assert pixel_values_vid.min() >= 0 and pixel_values_vid.max() <= 1
-        #     assert ref_img.min() >= 0 and ref_img.max() <= 1
-        #     assert pixel_values_past_frames.min() >= 0 and pixel_values_past_frames.max() <= 1
-        
-        # # Make sure this feature is right: Get target wav features
-
-        # clip_st = target_frame_indices_new[past_batch_index[0]] / original_fps
-        # clip_et = target_frame_indices_new[tgt_batch_index[-1]] / original_fps
-        # wav_st = int(clip_st * target_fps)
-        # wav_et = int(clip_et * target_fps)
-        
-        # ## Add wav_feat here
-        # # if wav_et >= len(wav_fea):
-        # #     wav_et = len(wav_fea)
-        # # target_wav_fea = wav_fea[wav_et - self.n_sample_frames : wav_et]
-        # assert len(pixel_values_vid) == self.n_sample_frames and len(pixel_values_past_frames) == self.past_n, \
-        #     "pixel_values cannot meet length threshold"
-        
-        # if os.path.exists(video_path.replace("mp4", "wav")):
-        #     gt_filt_audio = video_path.replace("mp4", "wav")
-        # elif os.path.exists(video_path.replace("+resampled.mp4", "+audio.wav")):
-        #     gt_filt_audio = video_path.replace("+resampled.mp4", "+audio.wav")
-        # else:
-        #     gt_filt_audio = video_path.replace("+resampled.mp4", "+audiov4.wav")
-        
-        # sample = dict(
-        #     video_path=video_path,
-        #     pixel_values_vid=pixel_values_vid,  # f,3,512,512
-        #     pixel_values_ref_img=ref_img,  # 1+n,3,512,512
-        #     pixel_values_past_frames=pixel_values_past_frames, 
-        #     ref_img_original=ref_img_original,
-        #     pixel_values_vid_original=pixel_values_vid_original,
-        #     pixel_values_past_frames_original=pixel_values_past_frames_original,
-        #     eye_mouth_mask_vid=eye_mouth_mask_vid,
-        #     eye_mouth_mask_past_frames=eye_mouth_mask_past_frames,
-            
-        #     eye_mouth_mask_no_scale_past_frames=eye_mouth_mask_no_scale_past_frames,
-        #     eye_mouth_mask_no_scale_vid=eye_mouth_mask_no_scale_vid,
-            
-        #     eyeball_pixel_values_vid=eyeball_pixel_values_vid, 
-        #     eyeball_past_frames=eyeball_past_frames,
-        #     eyeball_ref_img=eyeball_ref_img,
-
-        #     keypoints=face_keypoints_original,
-        #     batch_left_eye_bbox=np.concatenate([batch_left_eye_bbox[-self.past_n:], batch_left_eye_bbox[:self.n_sample_frames]]).reshape(-1, 4),
-        #     batch_right_eye_bbox=np.concatenate([batch_right_eye_bbox[-self.past_n:], batch_right_eye_bbox[:self.n_sample_frames]]).reshape(-1, 4),
-        #     batch_mouth_bbox=np.concatenate([batch_mouth_bbox[-self.past_n:], batch_mouth_bbox[:self.n_sample_frames]]).reshape(-1, 4),
-        #     batch_lip_movements=np.concatenate([batch_lip_movements[-self.past_n:], batch_lip_movements[:self.n_sample_frames]]),
-        # )
 
         if self.save_gt:
             if os.path.exists(video_path.replace("mp4", "wav")):
@@ -1511,10 +1182,7 @@ def save_video_as_image(func_args):
         pickle.dump(meta_result, f) 
 
 if __name__ == "__main__":
-    # RUN_FUNC = os.environ["RUN_FUNC"]
-    # RUN_FUNC = 'test_fast_video_dataset'
-    # print(f"{RUN_FUNC=}")
-    # eval(RUN_FUNC)()
+    # How to use this script ?
     # save_visual is default mode, save visual video, mask and i2v condition
     # /home/weili/miniconda3/envs/wan21_xc/bin/python 
     #    videox_fun/data/emo_video_live_body_cache.py 
