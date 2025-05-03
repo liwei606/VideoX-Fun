@@ -167,8 +167,9 @@ class LiveVideoLoadDataset(Dataset):
                                                audio_path,
                                                clip_st,
                                                clip_et,)
-            if audio_feature.size(1) != 51840:
-                print(f"{audio_feature.shape=} {audio_path=} {clip_st=} {clip_et=} {clip_target_idx=}")
+            assert audio_feature.size(1) == 51840, f"{audio_feature.size(1)=} != 51840"
+            # if audio_feature.size(1) != 51840:
+            #     print(f"{audio_feature.shape=} {audio_path=} {clip_st=} {clip_et=} {clip_target_idx=}")
         mouth_bboxs = []
         left_eye_bboxs = []
         right_eye_bboxs = []

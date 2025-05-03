@@ -46,26 +46,8 @@ def get_wav_vocal(
     process_vocals_path = wav_path[:-4] + ("_demucs.wav" if not demucsv4 else "_demucsv4.wav")
     if not os.path.exists(process_vocals_path) and is_main_process:
         wav_path = str(wav_path)
-        # audio, sampling_rate = demucs_read_audio(wav_path)
-        # audio_duration = len(audio) / sampling_rate
-        # if audio_duration <= 8:
         res = demucs_model(wav_path)
         vocals = res["vocals"].cpu()
-        # else:
-        #     clip_len = 8 * sampling_rate
-        #     stride = 6 * sampling_rate
-        #     vocals = np.zeros_like(audio)
-        #     weights = np.zeros_like(audio)
-        #     for audio_clip_s in tqdm(range(0, len(audio), stride), desc="Preprocess Demucs for audio"):
-        #         audio_item = audio[audio_clip_s: audio_clip_s + clip_len]
-        #         demucs_model = copy.deepcopy(demucs_model_ori)
-        #         res = demucs_model(audio_item, sampling_rate)
-        #         vocal = res["vocals"].cpu()
-        #         end_idx = audio_clip_s + clip_len
-        #         vocals[audio_clip_s:end_idx] += vocal
-        #         weights[audio_clip_s:end_idx] += 1.0
-        #     weights = np.clip(weights, min=1e-8)
-        #     vocals /= weights
         audiofile.write(process_vocals_path, vocals, demucs_model.sample_rate)
     return process_vocals_path
 
@@ -140,7 +122,6 @@ sampler_name        = "Flow_Unipc"
 # Used when the sampler is in "Flow_Unipc", "Flow_DPM++".
 # If you want to generate a 480p video, it is recommended to set the shift value to 3.0.
 # If you want to generate a 720p video, it is recommended to set the shift value to 5.0.
-shift               = 3 
 
 # Load pretrained model if need
 vae_path            = None
@@ -152,7 +133,7 @@ if __name__ == "__main__":
     #   examples/wan2.1/predict_ai2v.py 
     #   --validation_config default config/wan2.1/ai2v_1.3B_base_infer.yaml 
     #   --infer_mode default ai2v
-    #   --model_name default models/Wan2.1-Fun-1.3B-InP  
+    #   --model_name default models/Wan2.1-Fun-1.3B-InP 
     #   --wav2vec_model_dir default models/wav2vec2-base-960h
     #   --transformer_path default None
     
@@ -165,12 +146,12 @@ if __name__ == "__main__":
     #   --demucsv4 
     #   --process_audio_only 
     
-    #   --ulysses_degree 2
-    #   --ring_degree 2
+    #   --ulysses_degree 2 default 1
+    #   --ring_degree 2 default 1
     #   --enable_teacache 
     
-    #   --num_inference_steps
-    #   --sample_shift
+    #   --num_inference_steps default 50 
+    #   --sample_shift default 5 
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--validation_config", type=str, default="config/wan2.1/ai2v_1.3B_base_infer.yaml")
@@ -187,12 +168,13 @@ if __name__ == "__main__":
     # data related
     parser.add_argument("--video_sample_size", type=int, default=720,)
     parser.add_argument("--video_length", type=int, default=81)
+    parser.add_argument("--audio_scale", type=float, default=1)
     parser.add_argument("--demucsv4", action="store_true")
     parser.add_argument("--process_audio_only", action="store_true")
     parser.add_argument("--fps", type=int, default=25)
     # Diffusion related
     parser.add_argument("--num_inference_steps", type=int, default=50,)
-    parser.add_argument("--sample_shift", type=float, default=0,)
+    parser.add_argument("--sample_shift", type=float, default=5,)
     # Parallel related
     parser.add_argument("--ulysses_degree", type=int, default=1)
     parser.add_argument("--ring_degree", type=int, default=1)
@@ -373,15 +355,16 @@ if __name__ == "__main__":
     if lora_path is not None:
         pipeline = merge_lora(pipeline, lora_path, lora_weight, device=device)
 
-    for (validation_image_start, 
-        validation_prompt, 
-        validation_neg_prompt,
-        validation_audio_path) in tqdm(valid_config.data.test_cases):
+    for test_case in tqdm(valid_config.data.test_cases):
+        validation_image_start = test_case[0]
+        validation_prompt = test_case[1]
+        validation_neg_prompt = test_case[2]
         basename = os.path.basename(validation_image_start)[:-4]
         save_path = os.path.join(args.save_dir_path, basename)
         if os.path.exists(save_path): continue
         with torch.no_grad():
             if args.infer_mode == "ai2v":
+                validation_audio_path = test_case[3]
                 audio_vocal_path = get_wav_vocal(demucs_model, validation_audio_path, args.demucsv4, is_main_process)
                 if ulysses_degree > 1 or ring_degree > 1:
                     dist.barrier()
@@ -420,8 +403,9 @@ if __name__ == "__main__":
                 mask_video   = input_video_mask,
                 clip_image = clip_image,
                 audio_wav2vec_fea = audio_wav2vec_fea if args.infer_mode == "ai2v" else None,
+                audio_scale = args.audio_scale,
                 cfg_skip_ratio = cfg_skip_ratio,
-                shift = shift,
+                shift = args.sample_shift,
             ).videos
 
         def save_results():

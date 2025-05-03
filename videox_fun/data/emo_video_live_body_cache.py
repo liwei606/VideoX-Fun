@@ -8,6 +8,7 @@ from typing import List
 import copy
 import imageio
 import numpy as np
+import librosa
 import torch
 import torchvision.transforms.v2 as transforms
 from decord import VideoReader
@@ -1022,6 +1023,24 @@ class LiveVideoDataset(Dataset):
             bs_img = video_reader.get_batch(target_frame_indices_new[idx]).asnumpy()
             return [Image.fromarray(bs_img[idxl]) for idxl in range(len(bs_img))]
         
+        # check audio valid
+        if os.path.exists(video_path.replace("mp4", "wav")):
+            gt_filt_audio = video_path.replace("mp4", "wav")
+        elif os.path.exists(video_path.replace("+resampled.mp4", "+audio.wav")):
+            gt_filt_audio = video_path.replace("+resampled.mp4", "+audio.wav")
+        else:
+            gt_filt_audio = video_path.replace("+resampled.mp4", "+audiov4.wav")
+        assert os.path.exists(gt_filt_audio), f"{gt_filt_audio} is not exist"
+        audio_input, sample_rate = librosa.load(gt_filt_audio, sr=None)
+        clip_st = target_frame_indices_new[past_batch_index[0]] / original_fps
+        clip_et = (target_frame_indices_new[tgt_batch_index[-1]] + 1) / original_fps
+        audio_endt = len(audio_input) / sample_rate
+        assert (target_frame_indices_new[tgt_batch_index[-1]] - target_frame_indices_new[past_batch_index[0]] + 1) == (self.n_sample_frames + self.past_n), \
+            f"clip_target_idx={target_frame_indices_new[past_batch_index + tgt_batch_index]} is unvalid"
+        assert audio_endt >= clip_et, f"{audio_endt=} is lower than {clip_et=}"
+        wav_st = int(clip_st * target_fps)
+        wav_et = int(clip_et * target_fps)
+        
         try:
             # using gpu 
             vid_pil_image_past = get_imgs_from_idx(past_batch_index)
@@ -1036,17 +1055,12 @@ class LiveVideoDataset(Dataset):
 
         for vid_pil_image in vid_pil_image_list:
             assert np.array(vid_pil_image).mean() >= 0.2, "Meet all black frames, skip It !!!"
-
-        ## crop image
         
+        ## crop image
         ref_img = crop_image_by_bbox(np.array(ref_img), crop_bbox, dsize=cur_img_size)
         vid_pil_image_list = [crop_image_by_bbox(np.array(img), crop_bbox, dsize=cur_img_size) for img in vid_pil_image_list]
         vid_pil_image_past = [crop_image_by_bbox(np.array(img), crop_bbox, dsize=cur_img_size) for img in vid_pil_image_past]
 
-        clip_st = target_frame_indices_new[past_batch_index[0]] / original_fps
-        clip_et = target_frame_indices_new[tgt_batch_index[-1]] / original_fps
-        wav_st = int(clip_st * target_fps)
-        wav_et = int(clip_et * target_fps)
         sample = dict(
             folder=folder,
             name=name,
@@ -1434,7 +1448,8 @@ if __name__ == "__main__":
         
         if args.save_cache:
             video_base = os.path.basename(video_path)[:-4]
-            save_dir = os.path.join(args.save_dir, video_base)
+            folder_base = os.path.basename(folder)[:-4]
+            save_dir = os.path.join(args.save_dir, folder_base, video_base)
             os.makedirs(save_dir, exist_ok=True)
             repeated_times = os.listdir(save_dir)
             cur_time = 0

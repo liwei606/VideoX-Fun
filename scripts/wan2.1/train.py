@@ -77,7 +77,7 @@ from videox_fun.data.dataset_image_video import (ImageVideoDataset,
 from videox_fun.data.emo_video_live_body_load import LiveVideoLoadDataset
 from videox_fun.models import (AutoencoderKLWan, CLIPModel, WanT5EncoderModel,
                               WanTransformer3DModel)
-from videox_fun.pipeline import WanPipeline, WanI2VPipeline
+from videox_fun.pipeline import WanPipeline, WanI2VPipeline, WanAI2VPipeline
 from videox_fun.utils.discrete_sampler import DiscreteSampling
 from videox_fun.utils.utils import get_image_to_video_latent, save_videos_grid, NeptuneLogger
 
@@ -257,7 +257,8 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
         )
 
         if args.train_mode != "normal":
-            pipeline = WanI2VPipeline(
+            PipelineClass = WanAI2VPipeline if args.train_mode == "ai2v" else WanI2VPipeline
+            pipeline = PipelineClass(
                 vae=accelerator.unwrap_model(vae).to(weight_dtype), 
                 text_encoder=accelerator.unwrap_model(text_encoder),
                 tokenizer=tokenizer,
@@ -314,18 +315,21 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                             height      = valid_video_height,
                             width       = valid_video_width,
                             guidance_scale = 6.0,
+                            num_inference_steps = args.num_inference_steps,
                             generator   = generator,
 
                             video        = input_video,
                             mask_video   = input_video_mask,
                             clip_image   = clip_image,
                             audio_wav2vec_fea = audio_wav2vec_fea if args.train_mode == "ai2v" else None,
+                            audio_scale = args.infer_audio_scale,
+                            shift = args.sample_shift,
                         ).videos
                         os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
                         save_path = os.path.join(args.output_dir, f"sample/sample-{global_step}-{i}-{basename}.mp4")
-                        save_path_tmp = save_path[:-4] + ("_tmp.mp4" if args.infer_mode == "ai2v" else ".mp4")
+                        save_path_tmp = save_path[:-4] + ("_tmp.mp4" if args.train_mode == "ai2v" else ".mp4")
                         save_videos_grid(sample, save_path_tmp)
-                        if args.infer_mode == "ai2v":
+                        if args.train_mode == "ai2v":
                             save_video_with_audio(save_path, save_path_tmp, validation_audio_path, start_time, end_time)
 
                         video_length = 1
@@ -337,11 +341,15 @@ def log_validation(vae, text_encoder, tokenizer, clip_image_encoder, transformer
                             height      = valid_video_height,
                             width       = valid_video_width,
                             guidance_scale = 6.0,
+                            num_inference_steps = args.num_inference_steps,
                             generator   = generator, 
 
                             video        = input_video,
                             mask_video   = input_video_mask,
                             clip_image   = clip_image,
+                            audio_wav2vec_fea = audio_wav2vec_fea[:, :5] if args.train_mode == "ai2v" else None,
+                            audio_scale = 0,
+                            shift = args.sample_shift,
                         ).videos
                         os.makedirs(os.path.join(args.output_dir, "sample"), exist_ok=True)
                         save_videos_grid(sample, os.path.join(args.output_dir, f"sample/sample-{global_step}-image-{i}-{basename}.mp4"))
@@ -407,7 +415,7 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="models/SkyReels-V2-I2V-1.3B-540P",
+        default="models/Wan2.1-Fun-1.3B-InP",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -650,7 +658,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=1000,
+        default=500,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -681,7 +689,7 @@ def parse_args():
     parser.add_argument(
         "--validation_steps",
         type=int,
-        default=1000,
+        default=500,
         help="Run validation every X steps.",
     )
     parser.add_argument(
@@ -702,6 +710,12 @@ def parse_args():
     )
     parser.add_argument(
         "--continuous_sampling", action="store_true", help="When training continuous samples, if it is set, uniform_sampling will be of no use"
+    )
+    parser.add_argument(
+        "--num_inference_steps", type=int, default=50, help="The ratio of motion sub loss."
+    )
+    parser.add_argument(
+        "--sample_shift", type=float, default=5, help="The ratio of motion sub loss."
     )
     parser.add_argument(
         "--enable_text_encoder_in_dataloader", action="store_true", help="Whether or not to use text encoder in dataloader."
@@ -871,6 +885,7 @@ def parse_args():
     parser.add_argument(
         "--audio_proj_dim", type=int, default=768, help="Audio Feature projection dim."
     )
+    parser.add_argument("--infer_audio_scale", type=float, default=1)
     
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -901,17 +916,18 @@ def main():
     #     --gradient_checkpointing 
     #     --gradient_checkpointing_rate 0.5 default 1
     #     --gradient_accumulation_steps 4 default 1 \
+    #     --transformer_path default None (pretrain of i2v or t2v)
     #     --resume_from_checkpoint latest default None
     #     Bellow is default --------------------------------------------------------
-    #     --pretrained_model_name_or_path default models/SkyReels-V2-I2V-1.3B-540P \
+    #     --pretrained_model_name_or_path default models/Wan2.1-Fun-1.3B-InP \
     #     --image_sample_size default 1024 \
     #     --video_sample_size default 720 \
     #     --video_sample_n_frames default 81 \
     #     --video_repeat default 1 \
     #     --dataloader_num_workers default 8 \
     #     --num_train_epochs default 1000 \
-    #     --checkpointing_steps default 1000 \
-    #     --validation_steps default 1000 \
+    #     --checkpointing_steps default 500 \
+    #     --validation_steps default 500 \
     #     --learning_rate default 2e-05 \
     #     --lr_scheduler default constant_with_warmup or select constant \
     #     --lr_warmup_steps default 100 \
@@ -1571,7 +1587,7 @@ def main():
     if args.train_mode != "normal":
         clip_image_encoder.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
     if args.train_mode == "ai2v":
-        wav2vec.to(accelerator.device if not args.low_vram else "cpu", dtype=weight_dtype)
+        wav2vec.to(accelerator.device if not args.low_vram else "cpu", dtype=torch.float32)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1849,7 +1865,7 @@ def main():
                             clip_context.append(_clip_context)
                         clip_context = torch.cat(clip_context)
                     if args.train_mode == "ai2v":
-                        audio_wav2vec_fea = wav2vec(audio_wav2vec_fea).last_hidden_state
+                        audio_wav2vec_fea = wav2vec(audio_wav2vec_fea.float()).last_hidden_state.to(accelerator.device, weight_dtype)
                         audio_scale_tensor = (torch.rand((audio_wav2vec_fea.size(0), ), device=accelerator.device, generator=torch_rng) >= 0.1).to(audio_wav2vec_fea)
                         
                                                 
