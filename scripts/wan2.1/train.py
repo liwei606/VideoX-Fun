@@ -150,17 +150,24 @@ def get_random_downsample_ratio(sample_size, image_ratio=[],
     else:
         return rng.choice(number_list, p = number_list_prob)
 
-def resize_mask(mask, latent, process_first_frame_only=True):
+def resize_mask(mask, latent, process_first_frame_only=True, mode='trilinear'):
     latent_size = latent.size()
     batch_size, channels, num_frames, height, width = mask.shape
 
-    if process_first_frame_only:
+    if mode == "nearest":
+        target_size = list(latent_size[2:])
+        resized_mask = F.interpolate(
+            mask,
+            size=target_size,
+            mode=mode,
+        )
+    elif process_first_frame_only:
         target_size = list(latent_size[2:])
         target_size[0] = 1
         first_frame_resized = F.interpolate(
             mask[:, :, 0:1, :, :],
             size=target_size,
-            mode='trilinear',
+            mode=mode,
             align_corners=False
         )
         
@@ -170,7 +177,7 @@ def resize_mask(mask, latent, process_first_frame_only=True):
             remaining_frames_resized = F.interpolate(
                 mask[:, :, 1:, :, :],
                 size=target_size,
-                mode='trilinear',
+                mode=mode,
                 align_corners=False
             )
             resized_mask = torch.cat([first_frame_resized, remaining_frames_resized], dim=2)
@@ -181,7 +188,7 @@ def resize_mask(mask, latent, process_first_frame_only=True):
         resized_mask = F.interpolate(
             mask,
             size=target_size,
-            mode='trilinear',
+            mode=mode,
             align_corners=False
         )
     return resized_mask
@@ -219,8 +226,8 @@ def get_audio_features(wav2vec, audio_processor, audio_path, fps, num_frames):
     # end_time = (0 + (num_frames - 1) * 1) / fps
     end_time = num_frames / fps
 
-    start_sample = int(start_time * sr)
-    end_sample = int(end_time * sr)
+    start_sample = int(round(start_time * sr))
+    end_sample = int(round(end_time * sr))
 
     try:
         audio_segment = audio_input[start_sample:end_sample]
@@ -880,6 +887,12 @@ def parse_args():
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
     )
     parser.add_argument(
+        "--mouth_region_weight",
+        type=float,
+        default=1.0,
+        help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
+    )
+    parser.add_argument(
         "--audio_in_dim", type=int, default=768, help="Audio Feature inner dim."
     )
     parser.add_argument(
@@ -905,6 +918,7 @@ def main():
     #     launch --num_processes 4 --main_process_port 28964 \
     #     scripts/wan2.1/train.py \
     #     --train_mode default i2v, could select ai2v or normal(t2v) \
+    #     --mouth_region_weight default 1
     #     --config_path config/wan2.1/sky_i2v_1.3B.yaml \
     #     --enable_bucket \
     #     --uniform_sampling \
@@ -1507,7 +1521,7 @@ def main():
 
             # Limit the number of frames to the same
             new_examples["pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["pixel_values"]])
-            new_examples["union_mouth_masks"] = torch.stack([example[:batch_video_length] for example in new_examples["union_mouth_masks"]])
+            new_examples["union_mouth_masks"] = torch.stack([example[:batch_video_length, 0:1, ...] for example in new_examples["union_mouth_masks"]])
             if args.train_mode != "normal":
                 new_examples["mask_pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["mask_pixel_values"]])
                 new_examples["mask"] = torch.stack([example[:batch_video_length] for example in new_examples["mask"]])
@@ -1683,6 +1697,7 @@ def main():
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
+        train_mouth_loss = 0.0
         batch_sampler.sampler.generator = torch.Generator().manual_seed(args.seed + epoch)
         for step, batch in enumerate(train_dataloader):
             # Data batch sanity check
@@ -1707,7 +1722,6 @@ def main():
             with accelerator.accumulate(transformer3d):
                 # Convert images to latent space
                 pixel_values = batch["pixel_values"].to(weight_dtype)
-
                 # Increase the batch size when the length of the latent sequence of the current sample is small
                 if args.training_with_video_token_length and not zero_stage == 3:
                     if args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 16 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
@@ -1729,16 +1743,19 @@ def main():
                     clip_pixel_values = batch["clip_pixel_values"].to(weight_dtype)
                     mask_pixel_values = batch["mask_pixel_values"].to(weight_dtype)
                     mask = batch["mask"].to(weight_dtype)
+                    union_mouth_masks = batch["union_mouth_masks"].to(weight_dtype)
                     # Increase the batch size when the length of the latent sequence of the current sample is small
                     if args.training_with_video_token_length and not zero_stage == 3:
                         if args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 16 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
                             clip_pixel_values = torch.tile(clip_pixel_values, (4, 1, 1, 1))
                             mask_pixel_values = torch.tile(mask_pixel_values, (4, 1, 1, 1, 1))
                             mask = torch.tile(mask, (4, 1, 1, 1, 1))
+                            union_mouth_masks = torch.tile(union_mouth_masks, (4, 1, 1, 1, 1))
                         elif args.video_sample_n_frames * args.token_sample_size * args.token_sample_size // 4 >= pixel_values.size()[1] * pixel_values.size()[3] * pixel_values.size()[4]:
                             clip_pixel_values = torch.tile(clip_pixel_values, (2, 1, 1, 1))
                             mask_pixel_values = torch.tile(mask_pixel_values, (2, 1, 1, 1, 1))
                             mask = torch.tile(mask, (2, 1, 1, 1, 1))
+                            union_mouth_masks = torch.tile(union_mouth_masks, (2, 1, 1, 1, 1))
                 if args.train_mode == "ai2v":
                     audio_wav2vec_fea = batch["audio_feature"].to(weight_dtype)
 
@@ -1771,6 +1788,7 @@ def main():
                     if args.train_mode != "normal":
                         mask_pixel_values = mask_pixel_values[:, :temp_n_frames, :, :]
                         mask = mask[:, :temp_n_frames, :, :]
+                        union_mouth_masks = union_mouth_masks[:, :temp_n_frames, :, :]
                     
                 # Keep all node same token length to accelerate the traning when resolution grows.
                 if args.keep_all_node_same_token_length:
@@ -1796,6 +1814,7 @@ def main():
                     if args.train_mode != "normal":
                         mask_pixel_values = mask_pixel_values[:, :actual_video_length, :, :]
                         mask = mask[:, :actual_video_length, :, :]
+                        union_mouth_masks = union_mouth_masks[:, :actual_video_length, :, :]
 
                 # Make the inpaint latents to be zeros.
                 if args.train_mode != "normal":
@@ -1848,6 +1867,8 @@ def main():
                         mask = mask.view(mask.shape[0], mask.shape[2] // 4, 4, mask.shape[3], mask.shape[4])
                         mask = mask.transpose(1, 2)
                         mask = resize_mask(1 - mask, latents)
+                        union_mouth_masks = rearrange(union_mouth_masks, "b f c h w -> b c f h w")
+                        union_mouth_masks = resize_mask(union_mouth_masks, latents, mode="nearest")
 
                         # Encode inpaint latents.
                         mask_latents = _batch_encode_vae(mask_pixel_values)
@@ -1982,11 +2003,13 @@ def main():
                         audio_scale=audio_scale_tensor if args.train_mode == "ai2v" else None
                     )
                 
-                def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):
+                def custom_mse_loss(noise_pred, target, weighting=None, threshold=50, spatial_mask=None):
                     noise_pred = noise_pred.float()
                     target = target.float()
                     diff = noise_pred - target
                     mse_loss = F.mse_loss(noise_pred, target, reduction='none')
+                    if spatial_mask is not None:
+                        mse_loss = mse_loss * spatial_mask
                     mask = (diff.abs() <= threshold).float()
                     masked_loss = mse_loss * mask
                     if weighting is not None:
@@ -1995,8 +2018,11 @@ def main():
                     return final_loss
                 
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+                loss_mouth = custom_mse_loss(noise_pred.float(), target.float(), weighting.float(), union_mouth_masks.float())
+                loss_mouth = loss_mouth.mean()
                 loss = custom_mse_loss(noise_pred.float(), target.float(), weighting.float())
                 loss = loss.mean()
+                loss = loss + loss_mouth * args.mouth_region_weight
 
                 if args.motion_sub_loss and noise_pred.size()[1] > 2:
                     gt_sub_noise = noise_pred[:, 1:, :].float() - noise_pred[:, :-1, :].float()
@@ -2007,6 +2033,8 @@ def main():
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                avg_mouth_loss = accelerator.gather(loss_mouth.repeat(args.train_batch_size)).mean()
+                train_mouth_loss += avg_mouth_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -2047,8 +2075,13 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
-                if accelerator.is_main_process: neptune_run.log("train_loss", train_loss)
+                accelerator.log({"train_mouth_loss": train_mouth_loss}, step=global_step)
+                if accelerator.is_main_process: 
+                    neptune_run.log("train_loss", train_loss)
+                    neptune_run.log("train_mouth_loss", train_mouth_loss)
+                    
                 train_loss = 0.0
+                train_mouth_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:
                     if args.use_deepspeed or accelerator.is_main_process:

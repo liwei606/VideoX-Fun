@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torchvision.transforms.v2 as transforms
 import librosa
+from tqdm import tqdm
 from transformers import Wav2Vec2Model, Wav2Vec2Processor
 from decord import VideoReader
 from omegaconf import OmegaConf
@@ -30,7 +31,7 @@ def get_cache_file_list(cache_file_path, data_type):
         return []
     results = []
     video_names = os.listdir(cache_file_path)
-    for video_name in video_names:
+    for video_name in tqdm(video_names):
         video_total_path = os.path.join(cache_file_path, video_name)
         item_paths = [(os.path.join(video_total_path, x), data_type) for x in os.listdir(video_total_path)]
         results.extend(item_paths)
@@ -40,8 +41,8 @@ def get_audio_features(audio_processor, audio_path, start_time, end_time):
     sr = 16000
     audio_input, sample_rate = librosa.load(audio_path, sr=sr)  # 采样率为 16kHz
 
-    start_sample = int(start_time * sr)
-    end_sample = int(end_time * sr)
+    start_sample = int(round(start_time * sr))
+    end_sample = int(round(end_time * sr))
 
     try:
         audio_segment = audio_input[start_sample: end_sample]
@@ -83,7 +84,12 @@ class LiveVideoLoadDataset(Dataset):
         
         vid_path = []
         for cache_file_path, weights, data_type in cache_file_path_list:
-            cur_res = get_cache_file_list(cache_file_path, data_type)
+            if os.path.isdir(cache_file_path):
+                cur_res = get_cache_file_list(cache_file_path, data_type)
+            elif cache_file_path.endswith(".npz"):
+                cur_res = list(np.load(cache_file_path, allow_pickle=True)["arr_0"])
+                cur_res = [(x, data_type) for x in cur_res]
+                
             print(f"Find {len(cur_res)} item in {cache_file_path}, weights is {weights}")
             vid_path += cur_res * weights
         
@@ -167,6 +173,8 @@ class LiveVideoLoadDataset(Dataset):
                                                audio_path,
                                                clip_st,
                                                clip_et,)
+            if audio_feature.size(1) != 51840:
+                import pdb; pdb.set_trace()
             assert audio_feature.size(1) == 51840, f"{audio_feature.size(1)=} != 51840"
             # if audio_feature.size(1) != 51840:
             #     print(f"{audio_feature.shape=} {audio_path=} {clip_st=} {clip_et=} {clip_target_idx=}")
@@ -215,7 +223,9 @@ class LiveVideoLoadDataset(Dataset):
         while True:
             try:
                 folder, data_type = self.dataset[index]
-                if start_data_type != data_type: continue
+                if start_data_type != data_type: 
+                    index = np.random.randint(0, len(self))
+                    continue
                 sample = self.get_item(index)
                 break
             except Exception as e:
@@ -234,7 +244,6 @@ import imageio
 import pickle
 import time
 import ffmpeg
-from tqdm import tqdm
 from einops import rearrange
 from accelerate.utils import set_seed
 

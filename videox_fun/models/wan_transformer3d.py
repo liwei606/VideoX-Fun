@@ -683,15 +683,17 @@ def split_audio_sequence(audio_proj_length, num_frames=81):
             end_token = tokens_per_frame * (i * 4 + 1)
             center_token = int((start_token + end_token) / 2) - 1
             pos_indices.append(center_token)
-
     # Build index ranges centered around each position
     pos_idx_ranges = [[idx - half_tokens, idx + half_tokens] for idx in pos_indices]
 
     # Adjust the first range to avoid negative start index
-    pos_idx_ranges[0] = [
-        -(half_tokens * 2 - pos_idx_ranges[1][0]),
-        pos_idx_ranges[1][0],
-    ]
+    if num_frames > 1:
+        pos_idx_ranges[0] = [
+            -(half_tokens * 2 - pos_idx_ranges[1][0]),
+            pos_idx_ranges[1][0],
+        ]
+    else:
+        pos_idx_ranges[0] = [0, audio_proj_length]
 
     return pos_idx_ranges
 
