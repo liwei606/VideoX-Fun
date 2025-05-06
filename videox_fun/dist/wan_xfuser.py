@@ -107,3 +107,58 @@ def usp_attn_forward(self,
     x = x.flatten(2)
     x = self.o(x)
     return x
+
+
+def apply_rotary_emb_transposed(x, freqs):
+    cos, sin = freqs.unsqueeze(-2).chunk(2, dim=-1)
+    x_real, x_imag = x.unflatten(-1, (-1, 2)).unbind(-1)
+    x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
+    out = x.float() * cos + x_rotated.float() * sin
+    out = out.to(x)
+    return out
+
+def usp_attn_forward_framepack(self,
+                     x,
+                     seq_lens,
+                     grid_sizes,
+                     freqs,
+                     dtype=torch.bfloat16):
+    b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+    half_dtypes = (torch.float16, torch.bfloat16)
+
+    def half(x):
+        return x if x.dtype in half_dtypes else x.to(dtype)
+
+    # query, key, value function
+    def qkv_fn(x):
+        q = self.norm_q(self.q(x)).view(b, s, n, d)
+        k = self.norm_k(self.k(x)).view(b, s, n, d)
+        v = self.v(x).view(b, s, n, d)
+        return q, k, v
+
+    q, k, v = qkv_fn(x)
+    # print(q.shape, freqs.shape)
+    q = apply_rotary_emb_transposed(q, freqs)
+    k = apply_rotary_emb_transposed(k, freqs)
+
+    # TODO: We should use unpaded q,k,v for attention.
+    # k_lens = seq_lens // get_sequence_parallel_world_size()
+    # if k_lens is not None:
+    #     q = torch.cat([u[:l] for u, l in zip(q, k_lens)]).unsqueeze(0)
+    #     k = torch.cat([u[:l] for u, l in zip(k, k_lens)]).unsqueeze(0)
+    #     v = torch.cat([u[:l] for u, l in zip(v, k_lens)]).unsqueeze(0)
+
+    x = xFuserLongContextAttention()(
+        None,
+        query=half(q),
+        key=half(k),
+        value=half(v),
+        window_size=self.window_size)
+
+    # TODO: padding after attention.
+    # x = torch.cat([x, x.new_zeros(b, s - x.size(1), n, d)], dim=1)
+
+    # output
+    x = x.flatten(2)
+    x = self.o(x)
+    return x
