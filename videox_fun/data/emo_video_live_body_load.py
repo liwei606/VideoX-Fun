@@ -89,7 +89,7 @@ class LiveVideoLoadDataset(Dataset):
             elif cache_file_path.endswith(".npz"):
                 cur_res = list(np.load(cache_file_path, allow_pickle=True)["arr_0"])
                 cur_res = [(x, data_type) for x in cur_res]
-                
+
             print(f"Find {len(cur_res)} item in {cache_file_path}, weights is {weights}")
             vid_path += cur_res * weights
         
@@ -108,9 +108,10 @@ class LiveVideoLoadDataset(Dataset):
             pixel_values.append(np.array(Image.open(img_path)))
         pixel_values = np.array(pixel_values)
         # text = "A person is speaking with lively facial expressions and clearly synchronized lip movements. The person's emotion remains calm throughout. The camera and the background behind the person are perfectly static, with no shaking or movement. The person's body movements are natural, with occasional gentle hand gestures. The video is highly realistic and sharp, with clear details on the face and hands."
-        text = "A person is speaking."
         with open(os.path.join(folder, "meta_result.pkl"), 'rb') as f:
             meta_result = pickle.load(f)
+        text = meta_result["text"] if "text" in meta_result else "A person is speaking."
+        text = text.replace(" ", " ")
         folder, name = meta_result["folder"], meta_result["name"]
         
         metadata_file = f"{folder}/metadata/{name}/metadata_mmpose.npz"
@@ -197,9 +198,15 @@ class LiveVideoLoadDataset(Dataset):
             mouth_masks.append(np.array(get_mask(mouth_bbox, updated_h, updated_w, scale=1.0)))
         
         mouth_masks = np.array(mouth_masks)
-        union_left_eye_masks = np.array(get_mask(np.array(left_eye_bboxs).max(axis=0), updated_h, updated_w, scale=1.0))
-        union_right_eye_masks = np.array(get_mask(np.array(right_eye_bboxs).max(axis=0), updated_h, updated_w, scale=1.0))
-        union_mouth_masks = np.array(get_mask(np.array(mouth_bboxs).max(axis=0), updated_h, updated_w, scale=1.0))
+        left_eye_bboxs = np.array(left_eye_bboxs)
+        right_eye_bboxs = np.array(right_eye_bboxs)
+        mouth_bboxs = np.array(mouth_bboxs)
+        left_eye_bboxs = np.concatenate([left_eye_bboxs[:, :2].min(axis=0), left_eye_bboxs[:, 2:].max(axis=0)])
+        right_eye_bboxs = np.concatenate([right_eye_bboxs[:, :2].min(axis=0), right_eye_bboxs[:, 2:].max(axis=0)])
+        mouth_bboxs = np.concatenate([mouth_bboxs[:, :2].min(axis=0), mouth_bboxs[:, 2:].max(axis=0)])
+        union_left_eye_masks = np.array(get_mask(left_eye_bboxs, updated_h, updated_w, scale=1.0))
+        union_right_eye_masks = np.array(get_mask(right_eye_bboxs, updated_h, updated_w, scale=1.0))
+        union_mouth_masks = np.array(get_mask(mouth_bboxs, updated_h, updated_w, scale=1.0))
         
         sample = {
             "pixel_values": pixel_values,
@@ -302,7 +309,9 @@ if __name__ == "__main__":
     set_seed(args.seed)
     # visual norm data
     dataset_file_path = args.dataset_file_path
-    visual_dir_name = "liveLoad_" + os.path.basename(dataset_file_path)
+    dataset_file_base = os.path.basename(dataset_file_path)
+    dataset_file_base = dataset_file_base[:-4] if dataset_file_base.endswith(".npz") else dataset_file_base
+    visual_dir_name = "liveLoad_" + dataset_file_base
     config["data"]["cache_file_path"] = [[dataset_file_path, 1, args.data_type]]
     config["data"]["eye_bbox_scale"] = args.eye_bbox_scale
     config["data"]["mouth_bbox_scale"] = args.mouth_bbox_scale

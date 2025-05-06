@@ -702,7 +702,7 @@ class WanAI2VPipeline(DiffusionPipeline):
                         seq_len=seq_len,
                         y=y,
                         clip_fea=clip_context_input,
-                        audio_fea=torch.cat([audio_wav2vec_fea, audio_wav2vec_fea]).cuda(),
+                        audio_fea=torch.cat([audio_wav2vec_fea, audio_wav2vec_fea]),
                         audio_scale=audio_scale_tensor.to(audio_wav2vec_fea),
                     )
 

@@ -495,6 +495,7 @@ class WanFunInpaintPipeline(DiffusionPipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         clip_image: Image = None,
         audio_wav2vec_fea: Optional[torch.FloatTensor] = None,
+        audio_scale: float = 1.0,
         max_sequence_length: int = 512,
         comfyui_progressbar: bool = False,
         cfg_skip_ratio: int = None,

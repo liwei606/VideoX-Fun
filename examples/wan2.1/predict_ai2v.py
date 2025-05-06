@@ -51,7 +51,7 @@ def get_wav_vocal(
         audiofile.write(process_vocals_path, vocals, demucs_model.sample_rate)
     return process_vocals_path
 
-def get_audio_features(wav2vec, audio_processor, audio_path, fps, num_frames):
+def get_audio_features(wav2vec, audio_processor, audio_path, fps, num_frames, device):
     sr = 16000
     audio_input, sample_rate = librosa.load(audio_path, sr=sr)  # 采样率为 16kHz
 
@@ -59,8 +59,8 @@ def get_audio_features(wav2vec, audio_processor, audio_path, fps, num_frames):
     # end_time = (0 + (num_frames - 1) * 1) / fps
     end_time = num_frames / fps
 
-    start_sample = int(start_time * sr)
-    end_sample = int(end_time * sr)
+    start_sample = int(round(start_time * sr))
+    end_sample = int(round(end_time * sr))
 
     try:
         audio_segment = audio_input[start_sample:end_sample]
@@ -69,7 +69,7 @@ def get_audio_features(wav2vec, audio_processor, audio_path, fps, num_frames):
 
     input_values = audio_processor(
         audio_segment, sampling_rate=sample_rate, return_tensors="pt"
-    ).input_values.to("cuda")
+    ).input_values.to(device)
 
     with torch.no_grad():
         fea = wav2vec(input_values).last_hidden_state
@@ -149,7 +149,9 @@ if __name__ == "__main__":
     #   --ulysses_degree 2 default 1
     #   --ring_degree 2 default 1
     #   --enable_teacache 
+    #   --per_gpu_per_case 
     
+    #   --guidance_scale 2
     #   --num_inference_steps default 50 
     #   --sample_shift default 5 
     
@@ -173,12 +175,14 @@ if __name__ == "__main__":
     parser.add_argument("--process_audio_only", action="store_true")
     parser.add_argument("--fps", type=int, default=25)
     # Diffusion related
+    parser.add_argument("--guidance_scale", type=float, default=6,)
     parser.add_argument("--num_inference_steps", type=int, default=50,)
     parser.add_argument("--sample_shift", type=float, default=5,)
     # Parallel related
     parser.add_argument("--ulysses_degree", type=int, default=1)
     parser.add_argument("--ring_degree", type=int, default=1)
     parser.add_argument("--enable_teacache", action="store_true")
+    parser.add_argument("--per_gpu_per_case", action="store_true")
     
     args = parser.parse_args()
     # Other params
@@ -210,18 +214,19 @@ if __name__ == "__main__":
     # prompt              = "A person is speaking."
     # negative_prompt     = "oversaturated colors, overexposed, static, blurry details, subtitles, style, artwork, painting, still frame, overall grayish, worst quality, low quality, JPEG artifacts, ugly, broken, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, deformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, people walking backward"
 
-    guidance_scale      = 6.0
+    guidance_scale      = args.guidance_scale
     seed                = 43
     num_inference_steps = args.num_inference_steps
     lora_weight         = 0.55
 
-    device = set_multi_gpus_devices(ulysses_degree, ring_degree)
+    device = set_multi_gpus_devices(ulysses_degree, ring_degree, args.per_gpu_per_case)
     is_main_process = False
-    if ulysses_degree * ring_degree > 1:
-        if dist.get_rank() == 0:
+    if ulysses_degree * ring_degree > 1 or args.per_gpu_per_case:
+        global_rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        if global_rank == 0:
             is_main_process = True
     else:
-
         is_main_process = True
     if not os.path.exists(args.save_dir_path) and is_main_process:
         os.makedirs(args.save_dir_path, exist_ok=True)
@@ -231,7 +236,7 @@ if __name__ == "__main__":
     demucs_model = demucs_models.Demucs(
         name="hdemucs_mmi" if not args.demucsv4 else "htdemucs_ft",
         other_metadata={"segment": 2, "split": True},
-        device="cuda:0",
+        device=device,
         logger=None,
     )
 
@@ -299,7 +304,7 @@ if __name__ == "__main__":
     # Get Audio Processor
     if args.infer_mode == "ai2v":
         wav2vec_processor = Wav2Vec2Processor.from_pretrained(args.wav2vec_model_dir)
-        wav2vec = Wav2Vec2Model.from_pretrained(args.wav2vec_model_dir).cuda().eval()
+        wav2vec = Wav2Vec2Model.from_pretrained(args.wav2vec_model_dir).to(device).eval()
 
     # Get Scheduler
     Choosen_Scheduler = scheduler_dict = {
@@ -323,7 +328,7 @@ if __name__ == "__main__":
         scheduler=scheduler,
         clip_image_encoder=clip_image_encoder,
     )
-    if ulysses_degree > 1 or ring_degree > 1:
+    if (ulysses_degree > 1 or ring_degree > 1) and not args.per_gpu_per_case:
         from functools import partial
         transformer.enable_multi_gpus_inference()
         if fsdp_dit:
@@ -354,8 +359,11 @@ if __name__ == "__main__":
 
     if lora_path is not None:
         pipeline = merge_lora(pipeline, lora_path, lora_weight, device=device)
-
-    for test_case in tqdm(valid_config.data.test_cases):
+    if args.per_gpu_per_case:
+        test_cases = valid_config.data.test_cases[global_rank::world_size]
+    else:
+        test_cases = valid_config.data.test_cases
+    for test_case in tqdm(test_cases):
         validation_image_start = test_case[0]
         validation_prompt = test_case[1]
         validation_neg_prompt = test_case[2]
@@ -365,11 +373,12 @@ if __name__ == "__main__":
         with torch.no_grad():
             if args.infer_mode == "ai2v":
                 validation_audio_path = test_case[3]
-                audio_vocal_path = get_wav_vocal(demucs_model, validation_audio_path, args.demucsv4, is_main_process)
-                if ulysses_degree > 1 or ring_degree > 1:
+                audio_vocal_path = get_wav_vocal(demucs_model, validation_audio_path, args.demucsv4, (is_main_process or args.per_gpu_per_case))
+                if (ulysses_degree > 1 or ring_degree > 1) and not args.per_gpu_per_case:
                     dist.barrier()
                 audio_wav2vec_fea, start_time, end_time = get_audio_features(
-                    wav2vec, wav2vec_processor, audio_vocal_path, args.fps, args.video_length
+                    wav2vec, wav2vec_processor, audio_vocal_path, 
+                    args.fps, args.video_length, device,
                 )
             if args.process_audio_only: continue
             video_length = int((args.video_length - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1 if args.video_length != 1 else 1
@@ -425,10 +434,11 @@ if __name__ == "__main__":
                 if args.infer_mode == "ai2v":
                     save_video_with_audio(save_path, save_path_tmp, validation_audio_path, start_time, end_time)
                 
-        if is_main_process:
+        if is_main_process or args.per_gpu_per_case:
             save_results()
-        if ulysses_degree > 1 or ring_degree > 1:
+        if (ulysses_degree > 1 or ring_degree > 1) and not args.per_gpu_per_case:
             dist.barrier()
-        
+    if args.per_gpu_per_case:
+        dist.barrier()
     if lora_path is not None:
         pipeline = unmerge_lora(pipeline, lora_path, lora_weight, device=device)

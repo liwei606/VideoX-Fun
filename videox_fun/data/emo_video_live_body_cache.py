@@ -597,12 +597,12 @@ class LiveVideoDataset(Dataset):
             vid_path += cur_res * weights
         
         # DEBUG -------------------------------------------
-        debug_vid_path = []
-        for data in vid_path:
-            (video_dir_root, video_name), _ = data
-            if "005933_00593343-Scene-038" in video_name:
-                debug_vid_path.append(data)
-        vid_path = debug_vid_path
+        # debug_vid_path = []
+        # for data in vid_path:
+        #     (video_dir_root, video_name), _ = data
+        #     if "005933_00593343-Scene-038" in video_name:
+        #         debug_vid_path.append(data)
+        # vid_path = debug_vid_path
         # DEBUG -------------------------------------------
         
         #### for debug 
@@ -1190,6 +1190,15 @@ from tqdm import tqdm
 from einops import rearrange
 from accelerate.utils import set_seed
 
+def get_parent_folder_names(folder_path, levels=4):
+    folder_names = []
+    for _ in range(levels):
+        folder_path, folder_name = os.path.split(folder_path)
+        if folder_name == "mnt" or folder_name == "weka":
+            break
+        folder_names.insert(0, folder_name)
+    return "_".join(folder_names)
+
 def save_video_as_image(func_args):
     pixel_values, v2i_dir, save_dir_item, meta_result = func_args
     for i, pixel_values_i in enumerate(pixel_values):
@@ -1229,7 +1238,7 @@ if __name__ == "__main__":
     #    --driving_video_scale default (1.5, 1.8)
     #    --vx_ratio_crop default -0.20
     #    --vy_ratio_crop default 0
-    #    --level2_driving_video_scale default (1.5, 1.8)
+    #    --level2_driving_video_scale default (1.5, 2.2)
     #    --level2_vx_ratio_crop default -0.10
     #    --level2_vy_ratio_crop default 0
     #    --lip_open_ratio default 0.
@@ -1448,8 +1457,8 @@ if __name__ == "__main__":
         
         if args.save_cache:
             video_base = os.path.basename(video_path)[:-4]
-            folder_base = os.path.basename(folder)[:-4]
-            save_dir = os.path.join(args.save_dir, folder_base, video_base)
+            folder_base = get_parent_folder_names(folder)
+            save_dir = os.path.join(args.save_dir, folder_base + "_" + video_base)
             os.makedirs(save_dir, exist_ok=True)
             repeated_times = os.listdir(save_dir)
             cur_time = 0

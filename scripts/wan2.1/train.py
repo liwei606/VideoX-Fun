@@ -953,6 +953,8 @@ def main():
     #     --max_grad_norm default 0.05
     #     --audio_in_dim default 768
     #     --audio_proj_dim default 768
+    #     --sample_shift default 5 
+    #     --infer_audio_scale default 1.0
     args = parse_args()
 
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -1918,7 +1920,7 @@ def main():
                         )
                         text_input_ids = prompt_ids.input_ids
                         prompt_attention_mask = prompt_ids.attention_mask
-                        import pdb; pdb.set_trace()
+                        # import pdb; pdb.set_trace()
                         seq_lens = prompt_attention_mask.gt(0).sum(dim=1).long()
                         prompt_embeds = text_encoder(text_input_ids.to(latents.device), attention_mask=prompt_attention_mask.to(latents.device))[0]
                         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]

@@ -8,6 +8,7 @@ import os
 import types
 import warnings
 from typing import Any, Dict, Optional, Union
+from functools import partial
 
 import numpy as np
 import torch
@@ -98,7 +99,6 @@ def flash_attention(
 
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
-
     # preprocess query
     if q_lens is None:
         q = half(q.flatten(0, 1))
@@ -107,7 +107,6 @@ def flash_attention(
                 device=q.device, non_blocking=True)
     else:
         q = half(torch.cat([u[:v] for u, v in zip(q, q_lens)]))
-
     # preprocess key, value
     if k_lens is None:
         k = half(k.flatten(0, 1))
@@ -118,7 +117,6 @@ def flash_attention(
     else:
         k = half(torch.cat([u[:v] for u, v in zip(k, k_lens)]))
         v = half(torch.cat([u[:v] for u, v in zip(v, k_lens)]))
-
     q = q.to(v.dtype)
     k = k.to(v.dtype)
 
@@ -422,6 +420,8 @@ class WanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.sp_world_size = 1
+        self.sp_world_rank = 0
 
     def forward(self, x, seq_lens, grid_sizes, freqs, dtype):
         r"""
@@ -441,7 +441,6 @@ class WanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
-
         x = attention(
             q=rope_apply(q, grid_sizes, freqs).to(dtype),
             k=rope_apply(k, grid_sizes, freqs).to(dtype),
@@ -559,12 +558,15 @@ class WanAI2VCrossAttention(WanI2VCrossAttention):
 
         nn.init.zeros_(self.k_audio_proj.weight)
         nn.init.zeros_(self.v_audio_proj.weight)
+        self.sp_world_size = 1
+        self.sp_world_rank = 0
 
     def __call__(
         self,
         x,
         context,
         context_lens,
+        seq_lens,
         dtype,
         audio_proj: torch.Tensor,
         audio_context_lens: torch.Tensor,
@@ -605,9 +607,17 @@ class WanAI2VCrossAttention(WanI2VCrossAttention):
             k_lens=context_lens
         )
         x = x.to(dtype)
-
         if len(audio_proj.shape) == 4:
-            audio_q = q.view(b * latents_num_frames, -1, n, d)  # [b, 21, l1, n, d]
+            # Context Parallel
+            if self.sp_world_size > 1:
+                audio_q = get_sp_group().all_gather(q, dim=1)
+                audio_q = torch.stack([
+                    audio_q[i, :seq_lens[i]] for i in range(audio_q.size(0))
+                ])
+            else:
+                audio_q = q
+            audio_q_seq_len = audio_q.size(1)
+            audio_q = audio_q.view(b * latents_num_frames, -1, n, d)  # [b, 21, l1, n, d]
             ip_key = self.k_audio_proj(audio_proj).view(b * latents_num_frames, -1, n, d)
             ip_value = self.v_audio_proj(audio_proj).view(b * latents_num_frames, -1, n, d)
             audio_x = attention(
@@ -616,7 +626,14 @@ class WanAI2VCrossAttention(WanI2VCrossAttention):
                 ip_value, 
                 k_lens=None
             )
-            audio_x = audio_x.view(b, q.size(1), n, d)
+            audio_x = audio_x.view(b, audio_q_seq_len, n, d)
+            if self.sp_world_size > 1:
+                seq_len_tars = [(int(math.ceil(seq_len / self.sp_world_size)) * self.sp_world_size) for seq_len in seq_lens]
+                audio_x = torch.cat([
+                    torch.cat([u, u.new_zeros(seq_len_tar - u.size(0), n, d)],
+                            dim=0).unsqueeze(0) for seq_len_tar, u in zip(seq_len_tars, audio_x)
+                ])
+                audio_x = torch.chunk(audio_x, self.sp_world_size, dim=1)[self.sp_world_rank]
             audio_x = audio_x.flatten(2)
         elif len(audio_proj.shape) == 3:
             ip_key = self.k_audio_proj(audio_proj).view(b, -1, n, d)
@@ -836,7 +853,7 @@ class WanAttentionBlock(nn.Module):
         def cross_attn_ffn(x, context, context_lens, e):
             # cross-attention
             if self.ai2v_enable:
-                x = x + self.cross_attn(self.norm3(x), context, context_lens, dtype, 
+                x = x + self.cross_attn(self.norm3(x), context, context_lens, seq_lens, dtype,
                             audio_proj, audio_context_lens, video_length, audio_scale,)
             else:
                 x = x + self.cross_attn(self.norm3(x), context, context_lens, dtype)
@@ -1107,7 +1124,12 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         for block in self.blocks:
             block.self_attn.forward = types.MethodType(
                 usp_attn_forward, block.self_attn)
-
+        self.apply(self._set_multi_gpus_inference)
+    
+    def _set_multi_gpus_inference(self, module):
+        module.sp_world_size = self.sp_world_size
+        module.sp_world_rank = self.sp_world_rank
+    
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
     
